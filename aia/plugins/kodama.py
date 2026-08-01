@@ -1,0 +1,414 @@
+"""Kodama-Lite, driven over MPRIS.
+
+Kodama-Lite already publishes an MPRIS service on the session D-Bus — see its
+`src-tauri/src/subsystems/media.rs`, which exists so a paired car head unit can
+drive playback over Bluetooth AVRCP. AIA is just another MPRIS client, so
+transport control works today with **no changes to Kodama-Lite at all**.
+Verified on the device: `Next`, `PlayPause`, `Previous`, `Stop` with `CanPlay`,
+`CanPause`, `CanGoNext`, `CanGoPrevious` and `CanSeek` all true, and a
+play/pause round trip moves the player and comes back.
+
+What MPRIS does *not* reach is anything that lives in the Kodama-Lite
+frontend: searching for a song, switching playlist, shuffle, repeat, lyrics,
+and the volume slider (which its `subsystems/volume.rs` documents as
+deliberately owned by the UI). Those need a control endpoint added to
+Kodama-Lite itself — planned as M5, and the reason `play` here resumes rather
+than searching.
+
+`playerctl` is shelled out to rather than binding D-Bus directly: measured at
+10 ms per call, which is negligible against a 2.5 s budget, and it avoids
+another native dependency.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+from pathlib import Path
+
+import requests
+
+from aia.plugins.base import CommandSpec, Plugin, Result
+
+log = logging.getLogger(__name__)
+
+PLAYER = "kodamalite"
+
+# Where Kodama-Lite publishes its control endpoint. Its stream server binds a
+# random port under a random per-launch token — deliberately, so knowing the
+# port is not enough to drive the app — which also means the URL cannot be
+# guessed. It writes it here, mode 0600, for a process running as the same
+# user. See `publish_control_endpoint` in its playback/server.rs.
+CONTROL_STATE = Path.home() / ".local/state/kodama-lite/control.json"
+
+# Spoken numbers. Whisper usually returns digits ("音量调到50%") but not
+# always, and a Chinese numeral is the natural way to say it.
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def parse_level(text: str) -> int | None:
+    """Read a 0-100 level out of a spoken phrase, in either language.
+
+    Handles "50", "fifty percent", "百分之五十", "五十", "一百". Returns None
+    when there is no number, so the caller can ask rather than guess.
+    """
+    if not text:
+        return None
+
+    # "百分之五十" is 50 percent, not 100 — strip the "percent of" marker
+    # before any digit or numeral hunting, or the 百 in it reads as a value.
+    text = text.replace("百分之", "").replace("百分比", "")
+
+    digits = re.search(r"\d+", text)
+    if digits:
+        return max(0, min(100, int(digits.group())))
+
+    words = {"zero": 0, "ten": 10, "twenty": 20, "thirty": 30, "forty": 40,
+             "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+             "ninety": 90, "hundred": 100, "full": 100, "half": 50,
+             "max": 100, "maximum": 100, "mute": 0}
+    lowered = text.lower()
+    for word, value in words.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return value
+
+    # Chinese numerals up to 一百. 五十 = 50, 五十五 = 55, 十五 = 15.
+    cn = re.sub(r"[^零〇一两二三四五六七八九十百]", "", text)
+    if not cn:
+        return None
+    if "百" in cn:
+        return 100
+    if "十" in cn:
+        before, _, after = cn.partition("十")
+        tens = _CN_DIGITS.get(before, 1) if before else 1
+        units = _CN_DIGITS.get(after, 0) if after else 0
+        return max(0, min(100, tens * 10 + units))
+    if len(cn) == 1 and cn in _CN_DIGITS:
+        return _CN_DIGITS[cn]
+    return None
+
+
+def _session_bus_env() -> dict:
+    """Environment with a session bus address, whatever we were started from.
+
+    AIA runs as a service, and a service (or an SSH login) inherits no
+    DBUS_SESSION_BUS_ADDRESS — playerctl would then find no players at all and
+    every command would look like "Kodama-Lite is not running". Kodama-Lite
+    runs as a systemd *user* service, so its bus is the per-uid socket.
+    """
+    env = dict(os.environ)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+    return env
+
+
+class KodamaLite(Plugin):
+    name = "kodama"
+    description = "Music player (Kodama-Lite)"
+
+    def _run(self, *args: str, timeout: float = 3.0) -> tuple[bool, str]:
+        try:
+            proc = subprocess.run(
+                ["playerctl", "-p", PLAYER, *args],
+                capture_output=True, text=True, timeout=timeout, env=_session_bus_env(),
+            )
+        except FileNotFoundError:
+            log.error("playerctl is not installed")
+            return False, ""
+        except subprocess.TimeoutExpired:
+            log.warning("playerctl %s timed out", " ".join(args))
+            return False, ""
+        return proc.returncode == 0, proc.stdout.strip()
+
+    def available(self) -> bool:
+        ok, _ = self._run("status", timeout=2.0)
+        return ok
+
+    # ── the control endpoint, for everything MPRIS cannot reach ──────
+
+    def _control_url(self) -> str | None:
+        """Current control URL, re-read each time.
+
+        Not cached: the token and port are regenerated on every launch of
+        Kodama-Lite, so a cached URL survives exactly until the app restarts
+        and then silently fails. Reading a small file per command costs
+        nothing against a 2.5 s budget.
+        """
+        try:
+            data = json.loads(CONTROL_STATE.read_text())
+        except FileNotFoundError:
+            log.debug("no control endpoint at %s", CONTROL_STATE)
+            return None
+        except (OSError, ValueError) as exc:
+            log.warning("cannot read %s: %s", CONTROL_STATE, exc)
+            return None
+        return data.get("url")
+
+    def _control(self, action: str, argument: str | None = None) -> bool:
+        url = self._control_url()
+        if not url:
+            return False
+        payload = {"action": action}
+        if argument is not None:
+            payload["argument"] = argument
+        try:
+            resp = requests.post(url, json=payload, timeout=3)
+        except requests.RequestException as exc:
+            log.warning("control %s failed: %s", action, exc)
+            return False
+        if resp.status_code >= 400:
+            log.warning("control %s returned %s", action, resp.status_code)
+            return False
+        return True
+
+    def _needs_control(self) -> Result:
+        """The endpoint is missing — almost always an out-of-date app."""
+        return Result.failed(
+            "That needs a newer version of Kodama-Lite.",
+            "这个功能需要更新版本的 Kodama-Lite。",
+        )
+
+    # ── command implementations ──────────────────────────────────────
+    # Each returns what to say. Confirmations are phrased for speech, not for
+    # a screen: short, and describing what happened rather than restating the
+    # command back at the user.
+
+    def _unavailable(self) -> Result:
+        return Result.failed(
+            "Kodama-Lite is not currently running.",
+            "Kodama-Lite 没有在运行。",
+        )
+
+    def pause(self) -> Result:
+        ok, _ = self._run("pause")
+        return Result.done("Paused.", "已暂停。") if ok else self._unavailable()
+
+    def resume(self) -> Result:
+        ok, _ = self._run("play")
+        return Result.done("Playing.", "开始播放。") if ok else self._unavailable()
+
+    def toggle(self) -> Result:
+        ok, _ = self._run("play-pause")
+        if not ok:
+            return self._unavailable()
+        _, status = self._run("status")
+        playing = status.lower() == "playing"
+        return Result.done("Playing." if playing else "Paused.",
+                           "开始播放。" if playing else "已暂停。")
+
+    def next_track(self) -> Result:
+        if not self._run("next")[0]:
+            return self._unavailable()
+        return Result.done("Next track.", "下一首。")
+
+    def previous_track(self) -> Result:
+        if not self._run("previous")[0]:
+            return self._unavailable()
+        return Result.done("Previous track.", "上一首。")
+
+    def stop(self) -> Result:
+        ok, _ = self._run("stop")
+        return Result.done("Stopped.", "已停止。") if ok else self._unavailable()
+
+    def now_playing(self) -> Result:
+        ok, title = self._run("metadata", "xesam:title")
+        if not ok:
+            return self._unavailable()
+        if not title:
+            return Result.done("Nothing is playing.", "现在没有播放。")
+        _, artist = self._run("metadata", "xesam:artist")
+        if artist:
+            return Result.done(f"{title}, by {artist}.", f"{title}，{artist}。")
+        return Result.done(f"{title}.", f"{title}。")
+
+    def play(self, query: str) -> Result:
+        if not self._control("play", query):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done(f"Playing {query}.", f"正在播放{query}。")
+
+    def search(self, query: str) -> Result:
+        if not self._control("search", query):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done(f"Searching for {query}.", f"正在搜索{query}。")
+
+    def volume(self, level: str) -> Result:
+        value = parse_level(level)
+        if value is None:
+            return Result.failed("What volume?", "音量调到多少？")
+        if not self._control("volume", str(value)):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done(f"Volume {value} percent.", f"音量百分之{value}。")
+
+    def shuffle(self, state: str = "") -> Result:
+        if not self._control("shuffle", state or None):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Shuffle toggled.", "随机播放已切换。")
+
+    def repeat(self, mode: str = "") -> Result:
+        if not self._control("repeat", mode or None):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Repeat toggled.", "循环模式已切换。")
+
+    def like(self) -> Result:
+        if not self._control("like"):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Liked.", "已点赞。")
+
+    def lyrics(self) -> Result:
+        if not self._control("lyrics"):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Showing lyrics.", "正在显示歌词。")
+
+    def karaoke(self, state: str = "") -> Result:
+        if not self._control("karaoke", state or None):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Karaoke mode.", "卡拉OK模式。")
+
+    def quit_app(self) -> Result:
+        if not self._control("quit"):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Closing Kodama-Lite.", "正在关闭 Kodama-Lite。")
+
+    def commands(self) -> list[CommandSpec]:
+        return [
+            CommandSpec(
+                name="pause", description="Pause playback", handler=self.pause,
+                phrases={
+                    "en": ("pause", "pause music", "pause the music", "stop music"),
+                    "zh": ("暂停", "暂停音乐", "暂停播放"),
+                },
+            ),
+            CommandSpec(
+                name="resume", description="Resume playback", handler=self.resume,
+                # The Chinese list is longer than it looks like it needs to be
+                # because a phrase is matched as a whole: 播放歌曲 scores only
+                # 0.75 against the phrase 播放, since the trailing 歌曲 is two
+                # thirds more syllables. Spoken forms are declared, not
+                # inferred, so each natural way of saying it gets an entry.
+                phrases={
+                    "en": ("resume", "play", "play music", "play some music",
+                           "continue", "resume music", "keep playing"),
+                    "zh": ("继续", "播放", "播放音乐", "播放歌曲", "继续播放",
+                           "开始播放", "放歌", "放音乐", "来点音乐"),
+                },
+            ),
+            CommandSpec(
+                name="toggle", description="Toggle play/pause", handler=self.toggle,
+                phrases={"en": ("play pause", "toggle playback"), "zh": ("暂停或播放",)},
+            ),
+            CommandSpec(
+                name="next", description="Skip to the next track", handler=self.next_track,
+                phrases={
+                    "en": ("next", "next track", "next song", "skip", "skip this song"),
+                    "zh": ("下一首", "下一曲", "切歌", "跳过"),
+                },
+            ),
+            CommandSpec(
+                name="previous", description="Go back to the previous track",
+                handler=self.previous_track,
+                phrases={
+                    "en": ("previous", "previous track", "previous song", "go back", "last song"),
+                    "zh": ("上一首", "上一曲", "返回上一首"),
+                },
+            ),
+            CommandSpec(
+                name="stop", description="Stop playback", handler=self.stop,
+                phrases={"en": ("stop", "stop playback"), "zh": ("停止", "停止播放")},
+            ),
+            CommandSpec(
+                name="now_playing", description="Say what is currently playing",
+                handler=self.now_playing,
+                phrases={
+                    "en": ("what's playing", "what is playing", "what song is this",
+                           "now playing", "what's this song"),
+                    "zh": ("现在播放什么", "这是什么歌", "正在播放什么"),
+                },
+            ),
+
+            # ── via the control endpoint ─────────────────────────────
+            # A `{slot}` runs to the end of the utterance. Note the trigger
+            # phrases here overlap with the whole-phrase ones above —
+            # "播放歌曲" is `resume`, "播放周杰伦" is `play`. The router
+            # prefers the whole-utterance match on a tie, which is what
+            # keeps those apart.
+            CommandSpec(
+                name="play", description="Search for a song and play it",
+                handler=self.play, params={"query": "song, artist or album"},
+                phrases={
+                    "en": ("play {query}", "put on {query}", "i want to hear {query}",
+                           "listen to {query}"),
+                    "zh": ("播放{query}", "我想听{query}", "来一首{query}",
+                           "放一首{query}", "听{query}"),
+                },
+            ),
+            CommandSpec(
+                name="search", description="Search without playing",
+                handler=self.search, params={"query": "what to search for"},
+                phrases={
+                    "en": ("search for {query}", "search {query}", "find {query}",
+                           "look for {query}"),
+                    "zh": ("搜索{query}", "搜寻{query}", "查找{query}", "帮我搜索{query}"),
+                },
+            ),
+            CommandSpec(
+                name="volume", description="Set the volume, 0-100",
+                handler=self.volume, params={"level": "0-100"},
+                phrases={
+                    "en": ("volume {level}", "set volume to {level}",
+                           "turn volume to {level}", "turn the volume to {level}"),
+                    "zh": ("音量{level}", "音量调到{level}", "把音量调到{level}",
+                           "声音调到{level}"),
+                },
+            ),
+            CommandSpec(
+                name="shuffle", description="Toggle shuffle", handler=self.shuffle,
+                phrases={
+                    "en": ("shuffle", "shuffle mode", "toggle shuffle", "random play"),
+                    "zh": ("随机播放", "随机模式", "打开随机播放", "切换随机播放"),
+                },
+            ),
+            CommandSpec(
+                name="repeat", description="Toggle repeat mode", handler=self.repeat,
+                phrases={
+                    "en": ("repeat", "repeat mode", "toggle repeat", "loop"),
+                    "zh": ("循环播放", "单曲循环", "重复播放", "切换循环"),
+                },
+            ),
+            CommandSpec(
+                name="like", description="Like the current track", handler=self.like,
+                phrases={
+                    "en": ("like this song", "like this", "favourite this song",
+                           "add to favourites", "thumbs up"),
+                    "zh": ("点赞", "喜欢这首歌", "收藏这首歌", "加入收藏"),
+                },
+            ),
+            CommandSpec(
+                name="lyrics", description="Show lyrics for the current track",
+                handler=self.lyrics,
+                phrases={
+                    "en": ("show lyrics", "lyrics", "show the lyrics",
+                           "search lyrics", "find the lyrics"),
+                    "zh": ("显示歌词", "歌词", "搜索歌词", "找歌词", "看歌词"),
+                },
+            ),
+            CommandSpec(
+                name="karaoke", description="Toggle full-screen karaoke",
+                handler=self.karaoke,
+                phrases={
+                    "en": ("karaoke", "karaoke mode", "full screen lyrics"),
+                    "zh": ("卡拉OK", "卡拉OK模式", "全屏歌词", "开启卡拉OK"),
+                },
+            ),
+            CommandSpec(
+                name="quit", description="Close Kodama-Lite", handler=self.quit_app,
+                confirm=True,
+                phrases={
+                    "en": ("close kodama", "quit kodama", "exit kodama",
+                           "close the music player"),
+                    "zh": ("退出软件", "关闭软件", "退出音乐播放器", "关闭播放器"),
+                },
+            ),
+        ]

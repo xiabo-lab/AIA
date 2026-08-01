@@ -1,0 +1,12 @@
+# This repo is authored on Windows and runs on Raspberry Pi OS. Anything the
+# Pi executes must arrive with LF endings — a CRLF shebang fails with the
+# famously unhelpful "bad interpreter: /usr/bin/env bash^M".
+*.sh    text eol=lf
+*.py    text eol=lf
+*.service text eol=lf
+
+# Model weights and audio are binary; never let git touch them.
+*.bin   binary
+*.gguf  binary
+*.onnx  binary
+*.wav   binary

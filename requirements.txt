@@ -1,0 +1,8 @@
+numpy
+scipy
+sounddevice
+webrtcvad-wheels
+requests
+vosk
+openwakeword
+setuptools

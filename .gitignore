@@ -1,0 +1,24 @@
+# Model weights — several GB, all re-fetchable by scripts/bench_m0.sh
+models/
+*.gguf
+*.bin
+*.onnx
+*.onnx.json
+
+# Third-party sources and binaries built on the Pi (whisper.cpp, llama.cpp, piper)
+vendor/
+
+# Benchmark scratch: build logs, generated test clips
+.bench/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Runtime
+*.log
+conversation_history.db
+config.local.toml
