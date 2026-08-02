@@ -1,0 +1,130 @@
+==========================================================================
+AIA — voice commands
+==========================================================================
+
+Wake word: 小艾同学
+
+Say the wake word, then the command — either in one breath
+("小艾同学播放五月天") or with a pause after it.
+
+Phrases are matched by SOUND, not spelling, so they do not have to be
+hit exactly: 不放歌曲 still reaches `resume`, and 下一手 reaches `next`.
+Anything not recognised as a command is repeated back.
+
+<...> marks a free-text argument. It always runs to the end of the
+sentence, because speech has no reliable way to mark where it stops.
+
+==========================================================================
+KODAMA — Music player (Kodama-Lite)
+==========================================================================
+
+  pause   [leaves audio stopped]
+    Pause playback
+      English : pause  |  pause music  |  pause the music  |  stop music
+      中文    : 暂停  |  暂停音乐  |  暂停播放
+
+  resume
+    Resume playback
+      English : resume  |  play  |  play music  |  play some music  |  continue  |  resume music  |  keep playing
+      中文    : 继续  |  播放  |  播放音乐  |  播放歌曲  |  继续播放  |  开始播放  |  放歌  |  放音乐  |  来点音乐
+
+  toggle
+    Toggle play/pause
+      English : play pause  |  toggle playback
+      中文    : 暂停或播放
+
+  next
+    Skip to the next track
+      English : next  |  next track  |  next song  |  skip  |  skip this song
+      中文    : 下一首  |  下一曲  |  切歌  |  跳过
+
+  previous
+    Go back to the previous track
+      English : previous  |  previous track  |  previous song  |  go back  |  last song
+      中文    : 上一首  |  上一曲  |  返回上一首
+
+  stop   [leaves audio stopped]
+    Stop playback
+      English : stop  |  stop playback
+      中文    : 停止  |  停止播放
+
+  now_playing
+    Say what is currently playing
+      English : what's playing  |  what is playing  |  what song is this  |  now playing  |  what's this song
+      中文    : 现在播放什么  |  这是什么歌  |  正在播放什么
+
+  play  <query>
+    Search for a song and play it
+      English : play {query}  |  put on {query}  |  i want to hear {query}  |  listen to {query}
+      中文    : 播放{query}  |  我想听{query}  |  来一首{query}  |  放一首{query}  |  听{query}
+
+  search  <query>
+    Search without playing
+      English : search for {query}  |  search {query}  |  find {query}  |  look for {query}
+      中文    : 搜索{query}  |  搜寻{query}  |  查找{query}  |  帮我搜索{query}
+
+  volume  <level>
+    Set the volume, 0-100
+      English : volume {level}  |  set volume to {level}  |  turn volume to {level}  |  turn the volume to {level}
+      中文    : 音量{level}  |  音量调到{level}  |  把音量调到{level}  |  声音调到{level}
+
+  shuffle
+    Toggle shuffle
+      English : shuffle  |  shuffle mode  |  toggle shuffle  |  random play
+      中文    : 随机播放  |  随机模式  |  打开随机播放  |  切换随机播放
+
+  repeat
+    Toggle repeat mode
+      English : repeat  |  repeat mode  |  toggle repeat  |  loop
+      中文    : 循环播放  |  单曲循环  |  重复播放  |  切换循环
+
+  like
+    Like the current track
+      English : like this song  |  like this  |  favourite this song  |  add to favourites  |  thumbs up
+      中文    : 点赞  |  喜欢这首歌  |  收藏这首歌  |  加入收藏
+
+  lyrics
+    Show lyrics for the current track
+      English : show lyrics  |  lyrics  |  show the lyrics  |  search lyrics  |  find the lyrics
+      中文    : 显示歌词  |  歌词  |  搜索歌词  |  找歌词  |  看歌词
+
+  karaoke
+    Toggle full-screen karaoke
+      English : karaoke  |  karaoke mode  |  full screen lyrics
+      中文    : 卡拉OK  |  卡拉OK模式  |  全屏歌词  |  开启卡拉OK
+
+  quit   [ASKS FOR CONFIRMATION, leaves audio stopped]
+    Close Kodama-Lite
+      English : close kodama  |  quit kodama  |  exit kodama  |  close the music player
+      中文    : 退出软件  |  关闭软件  |  退出音乐播放器  |  关闭播放器
+
+==========================================================================
+SYSTEM — The Raspberry Pi itself
+==========================================================================
+
+  shutdown   [ASKS FOR CONFIRMATION, leaves audio stopped]
+    Power off the Raspberry Pi
+      English : shut down  |  shutdown  |  power off  |  turn off the pi  |  shut down the pi
+      中文    : 关机  |  关闭电源  |  把树莓派关机  |  关掉设备
+
+  reboot   [ASKS FOR CONFIRMATION, leaves audio stopped]
+    Restart the Raspberry Pi
+      English : reboot  |  restart the pi  |  reboot the pi
+      中文    : 重启  |  重新启动  |  重启设备
+
+==========================================================================
+CONFIRMATION
+==========================================================================
+
+Commands marked ASKS FOR CONFIRMATION say what they are about to do
+and then keep listening — no wake word needed for the answer.
+
+  yes : 确定 · 是 · 是的 · 对 · 好 · 好的 · 可以 · 没错 · yes · sure · ok
+  no  : 取消 · 不 · 不要 · 别 · 算了 · 不用 · no · cancel · never mind
+
+Silence, or anything that is neither, cancels. For something
+irreversible, 'I could not tell' has to mean no.
+
+==========================================================================
+18 commands. Generated by scripts/dump_commands.py — do not edit by hand.
+==========================================================================

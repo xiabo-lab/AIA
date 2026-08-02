@@ -10,3 +10,7 @@
 *.gguf  binary
 *.onnx  binary
 *.wav   binary
+
+# Generated from plugin.manifest() — regenerate rather than editing.
+commands.txt   text eol=lf
+commands.html  text eol=lf
