@@ -9,7 +9,7 @@ entirely latency, and that is solvable with a routing change.
 The stack (whisper.cpp + Qwen2.5 3B + Piper + Pi 5) is sound and the two target apps already
 exist locally. I verified each spec requirement against measurements rather than assuming:
 
-**M0 ran on the target Pi (raspberrypi5, 10.0.0.113) on 2026-08-01 and every check passed.**
+**M0 ran on the target Pi on 2026-08-01 and every check passed.**
 The table below now reports measured values, not published ones.
 
 | Spec requirement | Measured on this Pi | Status |
@@ -124,21 +124,29 @@ Two techniques are mandatory to hold the fast path:
 
 Much simpler than the original spec implied, now that it is English + Mandarin:
 
-- **Recognition.** One model: `ggml-base` (multilingual), with `-l auto`. Verified on the
-  device: English and Mandarin clips in either order are detected correctly with no state
-  carried between them, so the spec's free mid-conversation switching works as written.
+- **Recognition.** One model: `ggml-base`. A conversation detects its language on the
+  first utterance and then names it outright until the conversation goes idle.
 
-  Auto-detect costs ~390 ms per utterance (a whole extra encoder pass), and a sticky-language
-  scheme was built to avoid it and then **removed**. It is worth recording why, because the
-  idea is tempting enough to reinvent: nothing detects "wrong language" cheaply. Whisper
-  emits text in the script you asked for, so a script check never fires — Mandarin forced
-  through English came back as fluent English prose, quietly *translated*. Mean word
-  probability did separate the bad case (0.17 vs 0.69), but only with temperature fallback
-  on, which is also what made that pass take **10.4 s**; disabling fallback to cap the
-  latency made Whisper produce a *confident* mistranslation instead (0.77), destroying the
-  signal. And reading confidence at all requires `verbose_json`, whose DTW pass costs
-  ~390 ms — the entire saving. Auto-detect is correct, bounded, and still leaves ~700 ms of
-  headroom. `aia/stt/engine.py` carries the full table.
+  This started as `-l auto` on every utterance and had to change: automatic detection ranges
+  over all 99 languages Whisper knows, and on the device it returned Korean (총치) and
+  Japanese (よいしょ, じゃあ) for Mandarin speech — text the router can never match and a
+  language the assistant does not support. Locking also happens to be **~390 ms per turn
+  cheaper**, because naming a language skips an encoder pass: measured 504-584 ms against
+  865-1020 ms.
+
+  An earlier attempt at a *per-utterance* sticky language was built and removed, and that
+  reasoning still stands, because the idea is tempting enough to reinvent: nothing detects
+  "wrong language" cheaply. Whisper emits text in the script you asked for, so a script check
+  never fires — Mandarin forced through English came back as fluent English prose, quietly
+  *translated*. Mean word probability did separate the bad case (0.17 vs 0.69), but only with
+  temperature fallback on, which is also what made that pass take **10.4 s**; disabling
+  fallback made Whisper produce a *confident* mistranslation instead (0.77). And reading
+  confidence at all requires `verbose_json`, whose DTW pass costs ~390 ms.
+
+  What ships is not that scheme. There is no per-utterance guessing: the language is fixed
+  for the conversation, and the only residual guess is a script check on the *first*
+  utterance, which redoes it in Chinese if it came back as an unsupported language.
+  `aia/stt/engine.py` carries the measurements.
 - **Reply language.** Detect the transcript's script and pick the Piper voice:
   Latin → `en_US-*`, Han → `zh_CN-huayan-medium`.
 - **Free mid-conversation switching** is genuinely achievable for this pair, so the spec's

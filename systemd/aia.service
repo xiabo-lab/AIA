@@ -1,0 +1,46 @@
+[Unit]
+Description=AIA voice assistant
+After=aia-whisper.service
+Wants=aia-whisper.service
+
+[Service]
+Type=simple
+
+# The conversation overlay is a Wayland layer-shell surface, so it needs a
+# compositor. A user service starts as soon as the session manager does,
+# which can be before labwc has created its socket — the same race
+# kodama-lite.service solves the same way. Without this the overlay starts,
+# finds no compositor, exits, and the assistant runs blind: still listening
+# and answering, but with nothing on screen and no obvious reason why.
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStartPre=/bin/sh -c 'until [ -e "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; do sleep 1; done'
+
+ExecStart=%h/AI_Assit/.venv/bin/python -m aia.main
+WorkingDirectory=%h/AI_Assit
+
+# Keep every captured utterance. A few KB each, and the only honest input for
+# diagnosing a misrecognition after the fact — the alternative is asking the
+# user to reproduce it, which they often cannot. Drop this line if the
+# recordings are unwanted.
+Environment=AIA_SAVE_AUDIO=1
+
+# Unbuffered, so `journalctl -f` shows a turn as it happens rather than in
+# 4 KB bursts. This is the log you read when someone says "it didn't hear me".
+Environment=PYTHONUNBUFFERED=1
+
+# The microphone is exclusive: exactly one reader. A crashed instance that
+# systemd restarts too eagerly can collide with the dying one still holding
+# the device, so the restart is unhurried.
+Restart=on-failure
+RestartSec=5
+
+# Loading the wake model, both Piper voices and waiting for whisper-server.
+TimeoutStartSec=120
+
+# Speech recognition and the wake word are CPU-hungry, but the foreground
+# app must stay responsive: the spec asks for exactly this. A positive nice
+# value keeps the assistant off the display's back under load.
+Nice=5
+
+[Install]
+WantedBy=default.target

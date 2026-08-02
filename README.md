@@ -63,12 +63,24 @@ Flags:
 --quick           fewer repetitions, rougher numbers
 ```
 
-## Try it
+## Running it
 
-On the Pi (`ssh raspberrypi5`), everything is already installed under `~/AI_Assit`:
+AIA runs as a pair of systemd **user** services and starts with the desktop
+session — user services rather than system ones because it needs the session bus
+(to drive the player over MPRIS) and the Wayland display (for the overlay):
+
+```bash
+./scripts/install-service.sh           # install, enable, start
+journalctl --user -u aia -f            # watch a conversation happen
+systemctl --user restart aia           # after changing the code
+systemctl --user stop aia              # free the mic for scripts/wake_test.py
+```
+
+To run it by hand instead — say, to try an environment variable:
 
 ```bash
 cd ~/AI_Assit
+systemctl --user stop aia              # the microphone allows one reader
 ./scripts/run_services.sh start        # resident whisper-server on :8081
 . .venv/bin/activate
 python -m aia.main                     # then say 小艾同学, pause, then speak

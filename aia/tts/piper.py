@@ -136,34 +136,38 @@ class Speaker:
 
     @staticmethod
     def _play(samples: np.ndarray, rate: int, blocking: bool) -> None:
-        """Play, re-querying the device list once if it has gone stale.
+        """Play, retrying briefly if the output device is momentarily busy.
 
-        PortAudio enumerates devices when it initialises and never looks
-        again. The Pi's only sink is HDMI, which PipeWire tears down and
-        recreates when the last client goes away — so a perfectly healthy
-        system can leave this process holding a device list in which the
-        default output is -1, and every reply then dies with
-        "Error querying device -1" while the rest of the turn works fine.
-        Re-initialising rebuilds the list from what is actually there now.
+        The Pi's only sink is HDMI, and it is not always instantly available —
+        a "Device unavailable" here is usually contention that clears in a
+        moment, so the retry is a short sleep and another attempt.
+
+        **Never re-initialise PortAudio to recover.** An earlier version
+        called `sd._terminate()` / `sd._initialize()` to rebuild a stale
+        device list, which does work for output — and also destroys the
+        *input* stream this process is holding open. The microphone went dead
+        the first time a reply failed to play, so the wake word fired exactly
+        once per run and then nothing. Output is not worth the ears: a lost
+        reply costs one sentence, a lost microphone costs the assistant.
         """
-        try:
-            sd.play(samples, rate)
-        except Exception as first:
-            log.warning("audio output failed (%s); re-querying devices", first)
+        for attempt in (0, 1, 2):
             try:
-                sd._terminate()
-                sd._initialize()
                 sd.play(samples, rate)
-            except Exception as second:
-                # Losing the spoken reply is bad but survivable; the command
-                # itself has already run. Never take the assistant down for it.
-                log.error("audio output still unavailable: %s", second)
-                return
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    # Survivable: the command itself has already run, and the
+                    # panel has already shown the reply on screen.
+                    log.error("audio output unavailable, reply not spoken: %s", exc)
+                    return
+                log.warning("audio output busy (%s); retrying", exc)
+                time.sleep(0.2)
+
         if blocking:
             try:
                 sd.wait()
             except Exception:
-                log.debug("sd.wait() failed after a device reset", exc_info=True)
+                log.debug("sd.wait() failed", exc_info=True)
 
     def wait(self) -> None:
         """Block until playback finishes.

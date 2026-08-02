@@ -276,6 +276,7 @@ class KodamaLite(Plugin):
         return [
             CommandSpec(
                 name="pause", description="Pause playback", handler=self.pause,
+                stops_playback=True,
                 phrases={
                     "en": ("pause", "pause music", "pause the music", "stop music"),
                     "zh": ("暂停", "暂停音乐", "暂停播放"),
@@ -316,6 +317,7 @@ class KodamaLite(Plugin):
             ),
             CommandSpec(
                 name="stop", description="Stop playback", handler=self.stop,
+                stops_playback=True,
                 phrases={"en": ("stop", "stop playback"), "zh": ("停止", "停止播放")},
             ),
             CommandSpec(
@@ -404,7 +406,8 @@ class KodamaLite(Plugin):
             ),
             CommandSpec(
                 name="quit", description="Close Kodama-Lite", handler=self.quit_app,
-                confirm=True,
+                confirm=True, stops_playback=True,
+                speech={"en": "close Kodama-Lite", "zh": "关闭音乐播放器"},
                 phrases={
                     "en": ("close kodama", "quit kodama", "exit kodama",
                            "close the music player"),

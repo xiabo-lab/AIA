@@ -45,6 +45,7 @@ from pathlib import Path
 import numpy as np
 
 from aia.core.config import WakeConfig
+from aia.router.fast import normalise, similarity
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,11 @@ log = logging.getLogger(__name__)
 # Feeding it our 30 ms capture frames directly works but wastes work and
 # blurs the detection boundary, so frames are buffered to this size.
 CHUNK_SAMPLES = 1280
+
+# How much of the running partial to scan for the wake phrase. Long enough to
+# hold the phrase plus a few syllables either side, short enough that the
+# window scan stays cheap when it runs on every frame.
+SCAN_CHARS = 24
 
 
 class WakeWord(ABC):
@@ -179,9 +185,15 @@ class VoskWakeWord(WakeWord):
         self._rec = KaldiRecognizer(self._model, rate)
         self._rate = rate
         self._KaldiRecognizer = KaldiRecognizer
+        # The phrase plus any spellings previously observed from this speaker.
+        # All are compared by sound, so the list only needs to cover genuinely
+        # different *pronunciations*, not different characters.
+        self._targets = tuple(dict.fromkeys((cfg.phrase, *cfg.variants)))
         log.info(
-            "wake phrase %r via Vosk (heard as any of %s), model loaded in %.0f ms",
-            cfg.phrase, "/".join(cfg.variants), (time.monotonic() - t0) * 1000,
+            "wake phrase %r via Vosk, matching by sound at >= %.2f (targets: %s), "
+            "model loaded in %.0f ms",
+            cfg.phrase, cfg.similarity, "/".join(self._targets),
+            (time.monotonic() - t0) * 1000,
         )
 
     def _heard(self) -> str:
@@ -191,6 +203,53 @@ class VoskWakeWord(WakeWord):
         partial = self._json.loads(self._rec.PartialResult()).get("partial", "")
         return partial.replace(" ", "")
 
+    def _matches(self, text: str) -> tuple[bool, float, str]:
+        """Does the tail of `text` sound like the wake phrase?
+
+        Exact string matching was the first implementation and it missed most
+        of the time in real use: a recogniser returns whatever characters fit
+        the sounds, and 小艾同学 comes back as 小爱同学, 小爱同雪, 消爱同学 and
+        others depending on how it was said. Listing every spelling is a losing
+        game.
+
+        Comparing *pinyin* collapses the whole family — every one of those is
+        `xiaoaitongxue` — which is the same reason the intent router matches by
+        sound rather than by character.
+
+        Every window is scanned, not just the tail. Tail-only looks sufficient
+        because partials usually grow a character at a time, but Vosk can jump
+        several at once, and then "小爱同学播放音乐" arrives whole and scores
+        0.48 against its own tail. The phrase has to be findable wherever it
+        sits. Only the recent text is scanned, so this stays cheap at 33 Hz.
+        """
+        if not text:
+            return False, 0.0, ""
+        text = text[-SCAN_CHARS:]
+        best = 0.0
+        best_window = ""
+        for target in self._targets:
+            span = len(target)
+            for width in (span - 1, span, span + 1):
+                if width <= 0:
+                    continue
+                if width > len(text):
+                    # Text shorter than any window: compare it whole rather
+                    # than skipping. Without this a two-character result like
+                    # 同学 scored a flat 0.00 — reported as "nothing like the
+                    # wake word" when it is in fact most of it.
+                    score = similarity(normalise(text), normalise(target))
+                    if score > best:
+                        best, best_window = score, text
+                    continue
+                for start in range(len(text) - width + 1):
+                    window = text[start:start + width]
+                    score = similarity(normalise(window), normalise(target))
+                    if score > best:
+                        best, best_window = score, window
+                        if best >= 1.0:
+                            return True, best, best_window
+        return best >= self.cfg.similarity, best, best_window
+
     def detect(self, frame: np.ndarray) -> bool:
         if self._rec.AcceptWaveform(frame.tobytes()):
             # Utterance finalised without the phrase appearing — drop it so the
@@ -199,8 +258,9 @@ class VoskWakeWord(WakeWord):
         else:
             text = self._heard()
 
-        if any(v in text for v in self.cfg.variants):
-            log.info("wake phrase detected in %r", text)
+        hit, score, window = self._matches(text)
+        if hit:
+            log.info("wake phrase detected: heard %r (%.2f) in %r", window, score, text)
             self.reset()
             return True
         return False

@@ -31,22 +31,12 @@ AUDIO_CTX=512
 start_whisper() {
   pgrep -f "whisper-server" >/dev/null && { echo "whisper-server already running"; return; }
   [[ -x "$WHISPER" ]] || { echo "missing $WHISPER — run scripts/bench_m0.sh first"; return 1; }
-  # Explicit -l en, not auto: auto-detect costs a second encoder pass (~400 ms
-  # per utterance). The client overrides language per request and falls back to
-  # the other language on a script mismatch — see aia/stt/engine.py.
-  # `-l auto` detects the spoken language per request, which is what makes
-  # switching between English and Mandarin mid-conversation work. It costs
-  # ~390 ms against naming a language outright; aia/stt/engine.py documents the
-  # cheaper scheme that was tried and why it was removed.
-  #
-  # Temperature fallback is deliberately left ON. Disabling it was tested to
-  # cap a pathological 10.4 s pass and made things worse — Whisper stopped
-  # producing detectable garbage and started producing confident
-  # mistranslations instead. Fallback only engages when a decode genuinely
-  # fails, which auto-detect makes rare.
-  setsid nohup "$WHISPER" -m "$WHISPER_MODEL" -t "$THREADS" -ac "$AUDIO_CTX" \
-    -l auto --port "$WHISPER_PORT" > "$LOGS/whisper-server.log" 2>&1 < /dev/null &
+  # Flags live in scripts/whisper-server.sh, which the systemd unit also
+  # execs, so a hand start and a boot start cannot end up differing.
+  setsid nohup "$ROOT/scripts/whisper-server.sh" \
+    > "$LOGS/whisper-server.log" 2>&1 < /dev/null &
   echo "whisper-server starting on :$WHISPER_PORT"
+  return 0
 }
 
 start_llama() {

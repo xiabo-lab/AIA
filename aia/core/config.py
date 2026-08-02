@@ -61,13 +61,31 @@ class WakeConfig:
     # What the user actually says.
     phrase: str = "小艾同学"
 
-    # What the recogniser actually *hears* when they say it. Exact characters
-    # do not matter — consistency does. Measured through the Mandarin voice,
-    # 小艾同学 comes back as 小爱同学 every time, a stable homophone (小爱 is
-    # also how Xiaomi spells its own wake word, so expect cross-triggering if
-    # one is in the room). Both spellings are accepted; add more here if the
-    # journal shows near-misses on a real voice.
-    variants: tuple[str, ...] = ("小爱同学", "小艾同学")
+    # 小爱 is also how Xiaomi spells its own wake word, so expect
+    # cross-triggering if one is in the room.
+    #
+    # What the recogniser actually returns when this user says the phrase,
+    # measured over 40 attempts. The leading 小 is dropped about half the
+    # time: it is a third tone, low and flat, and it sits at the very start
+    # of the utterance where the recogniser has the least context — while 爱
+    # (fourth tone, falling) is loud and survives. So the reliable core of
+    # the phrase is 爱同学, not 小爱同学, and the forms below are the shapes
+    # that core actually arrives in.
+    #
+    # These are compared by *sound*, so they only need to cover genuinely
+    # different pronunciations, not different spellings: 哎同学 also matches
+    # 唉同学 and 爱同学 for free.
+    variants: tuple[str, ...] = ("小爱同学", "小艾同学", "哎同学", "爱同学")
+
+    # How closely the tail of what was heard must *sound* like the phrase.
+    # Matching is done on pinyin, so spelling differences cost nothing and
+    # this is really a tolerance for dropped or slurred syllables.
+    #
+    # Lower to catch more, at the price of firing on ordinary speech: 0.70
+    # accepts roughly one wrong syllable in four. Measure before changing it —
+    # scripts/wake_test.py reports the score of every attempt, so the right
+    # value for a given voice and room is something to read off, not guess.
+    similarity: float = 0.72
 
     vosk_model: Path = MODELS / "vosk-model-small-cn-0.22"
 
@@ -115,6 +133,11 @@ class VadConfig:
     # Bail out if the user says nothing at all after the wake word. This is
     # the window to start speaking, so it has to tolerate a normal pause.
     max_wait_ms: int = 4000
+    # Longer window when waiting for a yes/no. The assistant has just asked a
+    # question and is holding the floor, so the user has to hear it, take it
+    # in, and decide — and silence here cancels an irreversible action, which
+    # is not something to do impatiently.
+    confirm_wait_ms: int = 8000
 
 
 @dataclass(frozen=True)
@@ -138,6 +161,20 @@ class SttConfig:
     # make it faster in any way worth having.
     auto_detect: bool = True
     default_language: str = "en"
+
+    # A conversation stays in the language it opened in. Only the first
+    # utterance is auto-detected; the rest name that language outright, which
+    # is both what a conversation actually is and ~390 ms faster per turn.
+    #
+    # It also removes the failure this was added for: automatic detection
+    # ranges over all 99 languages Whisper knows, and on Mandarin speech it
+    # returned Korean (총치) and Japanese (よいしょ, じゃあ) — untypeable by
+    # the router and unsupported by the assistant.
+    #
+    # The lock expires after this many seconds of no conversation, so
+    # switching language means pausing rather than restarting anything. Set
+    # to 0 to hold it until the process restarts.
+    lock_timeout_s: int = 300
     supported_languages: tuple[str, ...] = ("en", "zh")
 
     # Word-level probabilities (the spec's "transcription confidence score").

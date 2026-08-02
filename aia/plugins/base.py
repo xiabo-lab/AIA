@@ -28,6 +28,12 @@ class CommandSpec:
     description: str
     handler: Callable[..., "Result"]
 
+    # Same thing said in each language, for the confirmation question. Without
+    # it a Mandarin confirmation reads "这会Power off the Raspberry Pi。确定吗？"
+    # — half the sentence in the wrong language, at the exact moment the user
+    # most needs to understand what they are agreeing to.
+    speech: dict[str, str] = field(default_factory=dict)
+
     # Spoken forms, per language. `{slot}` marks a free-text argument — there
     # is at most one, and it always runs to the end of the utterance, because
     # anything after it cannot be delimited reliably in speech.
@@ -39,6 +45,15 @@ class CommandSpec:
     # Commands that destroy state need confirmation before running; the spec
     # requires it and the router refuses to fast-path them.
     confirm: bool = False
+
+    # This command is *meant* to leave audio stopped. Music is paused while
+    # the assistant listens (see audio/ducking.py) and normally resumed
+    # afterwards — but resuming after "pause" would undo the very thing that
+    # was asked for, so these opt out of the restore.
+    stops_playback: bool = False
+
+    def describe(self, language: str) -> str:
+        return self.speech.get(language) or self.description
 
     @property
     def takes_argument(self) -> bool:

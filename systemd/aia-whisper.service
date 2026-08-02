@@ -1,0 +1,26 @@
+[Unit]
+Description=AIA speech recognition (whisper.cpp server)
+Documentation=https://github.com/ggml-org/whisper.cpp
+# Started before the assistant, but the assistant does not *require* it:
+# aia.service waits for this to answer and reports a clear error if it never
+# does, which is friendlier than systemd refusing to start anything.
+Before=aia.service
+
+[Service]
+Type=simple
+ExecStart=%h/AI_Assit/scripts/whisper-server.sh
+WorkingDirectory=%h/AI_Assit
+
+# The model lives in memory for the life of the process — that is the whole
+# point of running a server rather than invoking the CLI per utterance, and
+# it is an architectural requirement of the latency budget, not a tuning
+# choice. See docs/PLAN.md, "M0".
+Restart=on-failure
+RestartSec=3
+
+# Loading ggml-base takes well under a second, but a cold SD card after boot
+# is slower than a warm one.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

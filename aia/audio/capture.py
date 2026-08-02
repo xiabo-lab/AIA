@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import time
 from typing import Iterator
 
 import numpy as np
@@ -19,6 +20,11 @@ from scipy.signal import butter, sosfilt, sosfilt_zi
 from aia.core.config import AudioConfig
 
 log = logging.getLogger(__name__)
+
+# No audio for this long means the stream has died rather than the room being
+# quiet — silence still arrives as frames. Generous enough never to fire on a
+# busy turn.
+STALL_TIMEOUT_S = 5.0
 
 
 def find_input_device(match: str) -> int:
@@ -139,6 +145,23 @@ class Microphone:
             self._stream.close()
             self._stream = None
 
+    def _restart(self) -> bool:
+        """Reopen the stream after it has stopped delivering."""
+        log.warning("microphone stopped delivering audio; reopening")
+        try:
+            if self._stream is not None:
+                self._stream.close()
+        except Exception:
+            log.debug("closing the dead stream failed", exc_info=True)
+        self._stream = None
+        try:
+            self.device = find_input_device(self.cfg.device_match)
+            self.__enter__()
+            return True
+        except Exception as exc:
+            log.error("could not reopen the microphone: %s", exc)
+            return False
+
     def frames(self) -> Iterator[np.ndarray]:
         """Yield fixed-size 16 kHz int16 frames forever, oldest first.
 
@@ -151,7 +174,18 @@ class Microphone:
         n = self.cfg.frame_samples
         residual = np.empty(0, dtype=np.int16)
         while True:
-            residual = np.concatenate([residual, self._downsample(self._q.get())])
+            try:
+                # A bare get() blocks forever, which is how a dead input
+                # stream presented as "the wake word works once and then
+                # never again" — silent, with no error anywhere. Time out
+                # and check instead, so a stall is recoverable and, more
+                # importantly, visible in the journal.
+                block = self._q.get(timeout=STALL_TIMEOUT_S)
+            except queue.Empty:
+                if not self._restart():
+                    time.sleep(1.0)
+                continue
+            residual = np.concatenate([residual, self._downsample(block)])
             while len(residual) >= n:
                 yield residual[:n]
                 residual = residual[n:]

@@ -5,37 +5,43 @@ has to stay in memory. Loading `ggml-base` costs ~96 ms and Piper's voice up to
 1190 ms — paying either on the critical path blows the budget. The server also
 isolates a crash in native code from the assistant process.
 
-## Language handling, and a design that was tried and rejected
+## Language handling
 
-Whisper's automatic language detection costs a whole extra encoder pass.
 Measured on this Pi 5, same clip, `-ac 512`:
 
     json + explicit language     499 ms (en)   624 ms (zh)
     json + auto                  877 ms (en)  1020 ms (zh)
     verbose_json + auto         1268 ms (en)  1407 ms (zh)
 
-Auto-detect costs ~+390 ms, and `verbose_json` costs a further ~+390 ms because
-it runs DTW alignment to produce word-level timestamps.
+Naming the language is ~390 ms cheaper than `auto`, and `verbose_json` costs a
+further ~390 ms because it runs DTW alignment for word-level timestamps.
 
-The obvious optimisation is to skip detection: transcribe in whatever language
-the user spoke last, and only re-run when that turns out to be wrong. That was
-built, measured, and removed, because nothing detects "wrong" cheaply enough:
+A conversation therefore detects its language **once** and then names it. The
+first version of this file tried a cleverer thing — transcribe in whatever was
+spoken last, and re-run when that turned out to be wrong — and it was removed,
+because nothing detects "wrong" cheaply:
 
-  * **Script does not work.** Whisper emits text in the script of the language
-    you asked for. Mandarin audio forced through English came back as fluent
-    English prose — it quietly *translated* rather than failing.
+  * **Script does not work as a wrongness test.** Whisper emits text in the
+    script of the language you asked for. Mandarin audio forced through English
+    came back as fluent English prose — it quietly *translated* rather than
+    failing.
   * **Confidence does not work reliably.** Mean word probability did separate
-    the bad case (0.17 vs 0.69) — but only with temperature fallback enabled,
-    which is also what made that pass take **10.4 s**. Disabling fallback to
-    cap the latency made Whisper settle on a confident mistranslation instead
-    (0.77, still 6.5 s), destroying the signal. And reading confidence at all
-    requires `verbose_json`, whose +390 ms is the entire saving.
+    the bad case (0.17 vs 0.69), but only with temperature fallback enabled,
+    which is also what made that pass take **10.4 s**. Disabling fallback made
+    Whisper settle on a confident mistranslation instead (0.77, still 6.5 s).
+    And reading confidence at all requires `verbose_json`, whose +390 ms is the
+    entire saving.
 
-So the saving was ~390 ms, the worst case was a 6-10 s pass returning a fluent
-translation of something the user never said, and the detector for it cost as
-much as the thing it was avoiding. Auto-detect is correct, predictable, and
-still leaves ~700 ms of headroom in the fast-path budget. Do not re-litigate
-this without new measurements.
+What replaced it is not that scheme. There is no per-utterance guessing: the
+language is fixed for the conversation the moment the first utterance is
+understood, and only reconsidered after the conversation goes idle. That is
+both what a conversation is, and — the reason it was actually needed —
+containment. Automatic detection ranges over all 99 languages Whisper knows,
+and on this device it returned Korean (총치) and Japanese (よいしょ, じゃあ) for
+Mandarin speech. Naming the language removes the choice.
+
+The one residual guess is `detect_script(...) == "other"`, which catches a
+first utterance that was decoded into an unsupported language and redoes it.
 """
 
 from __future__ import annotations
@@ -91,16 +97,75 @@ _LANG_NAMES = {"english": "en", "chinese": "zh"}
 
 
 class SpeechToText:
+    """Transcription, with the conversation's language held steady.
+
+    The first utterance is detected automatically; everything after it is
+    transcribed in that same language until the conversation goes idle. Two
+    reasons, and the second is the one that matters:
+
+    **It is what a conversation is.** People do not change language between
+    one sentence and the next, and an assistant that re-decides every time
+    will eventually decide wrong mid-exchange.
+
+    **Automatic detection ranges over all 99 languages Whisper knows.** On
+    this device it picked Korean and Japanese for Mandarin speech often
+    enough to matter — 총치, よいしょ, じゃあ — none of which can route, and
+    none of which the assistant supports. Naming the language removes the
+    choice, and is also ~390 ms faster per utterance than `auto`.
+    """
+
     def __init__(self, cfg: SttConfig, rate: int = 16000):
         self.cfg = cfg
         self.rate = rate
         self._session = requests.Session()
+        # The conversation's language, once known.
+        self.locked: str | None = None
+        self._last_used = 0.0
+
+    def _current_language(self) -> str:
+        """The language to ask for, expiring the lock if idle."""
+        if self.locked is None:
+            return "auto" if self.cfg.auto_detect else self.cfg.default_language
+        if (self.cfg.lock_timeout_s
+                and time.monotonic() - self._last_used > self.cfg.lock_timeout_s):
+            log.info("language lock on %r expired after %.0fs idle",
+                     self.locked, time.monotonic() - self._last_used)
+            self.locked = None
+            return "auto" if self.cfg.auto_detect else self.cfg.default_language
+        return self.locked
+
+    def reset_language(self) -> None:
+        """Forget the conversation's language, so the next turn re-detects."""
+        if self.locked is not None:
+            log.info("language lock on %r cleared", self.locked)
+        self.locked = None
 
     def listen(self, audio: np.ndarray) -> Transcript:
-        """Transcribe an utterance, detecting the language automatically."""
+        """Transcribe an utterance in the conversation's language."""
         wav = _wav_bytes(audio, self.rate)
+        result = self._transcribe(wav, self._current_language())
+
+        # Decoded in a language this assistant does not support. Redo it in a
+        # supported one rather than handing the router text it can never
+        # match — the CJK neighbours are what Whisper reaches for on Mandarin,
+        # so Chinese is the right second guess when nothing else is known.
+        if detect_script(result.text) == "other":
+            retry_in = self.locked or "zh"
+            log.info("transcript %r is not a supported language; retrying as %r",
+                     result.text[:20], retry_in)
+            result = self._transcribe(wav, retry_in)
+
+        script = detect_script(result.text)
+        if script in self.cfg.supported_languages:
+            result.language = script
+            if self.locked is None:
+                self.locked = script
+                log.info("conversation language locked to %r", script)
+        self._last_used = time.monotonic()
+        return result
+
+    def _transcribe(self, wav: bytes, language: str) -> Transcript:
         fmt = "verbose_json" if self.cfg.verbose else "json"
-        language = "auto" if self.cfg.auto_detect else self.cfg.default_language
 
         t0 = time.monotonic()
         resp = self._session.post(
@@ -115,12 +180,12 @@ class SpeechToText:
 
         text = (payload.get("text") or "").strip()
 
-        # Plain `json` carries no language field, so fall back to the script of
-        # the text. That is reliable here precisely *because* the language was
-        # auto-detected: Whisper has already decoded in the right language, so
-        # the script it produced is the answer rather than a guess.
+        # Plain `json` carries no language field. `language` is what was
+        # *asked for*, which for a locked conversation is already the answer;
+        # when it was "auto", the script of the text says what Whisper chose.
+        # `listen()` corrects this afterwards if the script disagrees.
         reported = _LANG_NAMES.get(str(payload.get("language", "")).lower())
-        lang = reported or detect_script(text) or self.cfg.default_language
+        lang = (reported if reported in self.cfg.supported_languages else None)             or (language if language in self.cfg.supported_languages else None)             or detect_script(text) or self.cfg.default_language
 
         confidence = None
         if self.cfg.verbose:
@@ -154,19 +219,41 @@ class SpeechToText:
         return False
 
 
+# Scripts that mean the language was detected wrongly. Whisper's automatic
+# detection ranges over all 99 languages it knows, and on Mandarin speech it
+# reaches for its CJK neighbours often enough to matter — real examples from
+# this device: 총치 (Korean), よいしょ and じゃあ (Japanese). None of that can
+# route, and none of it is a language this assistant supports.
+_FOREIGN_RANGES = (
+    ("぀", "ヿ"),  # hiragana + katakana
+    ("가", "힯"),  # hangul syllables
+    ("ᄀ", "ᇿ"),  # hangul jamo
+    ("Ѐ", "ӿ"),  # cyrillic
+    ("฀", "๿"),  # thai
+    ("؀", "ۿ"),  # arabic
+    ("ऀ", "ॿ"),  # devanagari
+)
+
+
 def detect_script(text: str) -> str | None:
-    """Crude English-vs-Chinese split on character ranges.
+    """Classify a transcript as `en`, `zh`, or `other`.
 
-    Only has to separate Latin from Han, which is a far easier call than
-    Cantonese from Mandarin — Whisper reports both of those as `zh`, which is
-    part of why Cantonese is out of scope for this stage.
+    `other` means Whisper decoded in a language this assistant does not
+    support — the caller re-runs the pass with an explicit language rather
+    than handing the router text it can never match.
 
-    Note that a code-switched command like "Play 周杰伦" resolves to `en`:
-    the carrier sentence is English and only the proper noun is not, so an
-    English reply is the right one.
+    Note a code-switched command like "Play 周杰伦" resolves to `en`: the
+    carrier sentence is English and only the proper noun is not, so an English
+    reply is the right one.
+
+    Japanese written purely in kanji is indistinguishable from Chinese here,
+    and deliberately so — it is Han either way, and the router matches by
+    pinyin, so treating it as Chinese loses nothing.
     """
     if not text:
         return None
+    if any(low <= ch <= high for ch in text for low, high in _FOREIGN_RANGES):
+        return "other"
     han = sum(1 for ch in text if "一" <= ch <= "鿿")
     latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
     if han and han >= latin:

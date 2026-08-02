@@ -42,8 +42,14 @@ class Endpointer:
             return False
         return self.vad.is_speech(frame.tobytes(), self.audio.target_rate)
 
-    def collect(self, frames) -> np.ndarray | None:
+    def collect(self, frames, on_frame=None) -> np.ndarray | None:
         """Consume frames until the utterance ends. Returns 16 kHz int16 audio.
+
+        `on_frame(frame, speech, started)` is called for every frame consumed,
+        so a caller can show what is being heard as it arrives. It exists for
+        scripts/wake_test.py, which displays a live transcript — the point of
+        the hook is that the tool watches the *real* endpointer rather than
+        reimplementing this loop and then disagreeing with it.
 
         Returns None if the user never actually said anything — the wake word
         fired on a false positive, or on the assistant's own output.
@@ -76,6 +82,8 @@ class Endpointer:
 
         for frame in frames:
             speech = self._is_speech(frame)
+            if on_frame is not None:
+                on_frame(frame, speech, started)
 
             if not started:
                 waited_ms += self._frame_ms
