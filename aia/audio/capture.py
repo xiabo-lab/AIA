@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from pathlib import Path
 from typing import Iterator
 
 import numpy as np
@@ -57,6 +58,15 @@ OVERRUN_REPORT_S = 5.0
 # stall tolerance at the price of staleness, and this number could not go up.
 QUEUE_SECONDS = 1.0
 
+# How long to wait before reopening a microphone that has stopped delivering,
+# and the ceiling that wait grows to. A device that has been unplugged cannot be
+# retried back into existence, so the interval doubles rather than spinning at a
+# fixed rate for as long as the assistant runs — but the ceiling stays low,
+# because this is an appliance and it has to recover on its own when the cable
+# goes back in.
+RESTART_BACKOFF_S = 1.0
+MAX_RESTART_BACKOFF_S = 30.0
+
 
 def find_input_device(match: str) -> int:
     """Index of the first input device whose name contains `match`.
@@ -69,10 +79,38 @@ def find_input_device(match: str) -> int:
         if dev["max_input_channels"] > 0 and match in dev["name"]:
             log.info("microphone: [%d] %s", idx, dev["name"].strip())
             return idx
+
+    # Not found is two different faults wearing the same face, and by far the
+    # likelier one is that the device is fine and somebody else has it: ALSA
+    # drops a card that is already open out of enumeration entirely, so
+    # PortAudio reports no inputs at all rather than a busy one. Saying "no
+    # input device" then sends the reader after the cable, the driver and the
+    # card number, when the answer is `systemctl --user stop aia`. The card
+    # stays listed in /proc/asound whether or not it is open, which is what
+    # tells the two apart.
+    if _card_present(match):
+        raise RuntimeError(
+            f"the microphone matching {match!r} exists but could not be opened — "
+            "it is almost certainly already in use. The device allows one "
+            "reader, and AIA is usually it: `systemctl --user stop aia`."
+        )
     raise RuntimeError(
         f"no input device matching {match!r}; "
         f"available: {[d['name'] for d in sd.query_devices() if d['max_input_channels'] > 0]}"
     )
+
+
+def _card_present(match: str) -> bool:
+    """Is a sound card whose description contains `match` known to the kernel?
+
+    Linux-only and best-effort — anywhere without /proc/asound this simply says
+    no and the caller falls back to the generic message.
+    """
+    try:
+        cards = Path("/proc/asound/cards").read_text()
+    except OSError:
+        return False
+    return match.lower() in cards.lower()
 
 
 class Microphone:
@@ -166,6 +204,15 @@ class Microphone:
         # of anything, and milliseconds of lost audio is the number that means
         # something to whoever reads the log line.
         self._dropped_samples = 0
+        self._drain_baseline = 0
+        # Samples the anti-alias filter pushed past full scale. Worth surfacing
+        # rather than silently flattening: it means the microphone gain is too
+        # high or the speaker is too close, which is a thing a person can fix.
+        self._clipped_samples = 0
+        # Set by the audio thread, read and cleared by the consumer. See
+        # `_callback` — logging from a realtime callback is not allowed here.
+        self._status = None
+        self._restart_failures = 0
         self._stream: sd.InputStream | None = None
         self._decim = cfg.capture_rate // cfg.target_rate
         if cfg.capture_rate % cfg.target_rate:
@@ -184,10 +231,15 @@ class Microphone:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
-            # Overflow means a consumer is too slow. Log rather than raise:
-            # dropping audio is far better than killing the assistant's only
-            # microphone.
-            log.warning("audio status: %s", status)
+            # Overflow means a consumer is too slow. Recorded rather than
+            # logged: this is a realtime thread with a hard deadline, and
+            # logging takes locks, formats strings and writes to the journal —
+            # any of which can block on something another thread holds. It is
+            # also self-reinforcing, because PortAudio raises these flags
+            # precisely when the machine is already struggling, so the report
+            # arrives as a burst and lengthens the stall it is reporting. The
+            # consumer says it out loud instead.
+            self._status = status
 
         # copy() because PortAudio reuses this buffer after we return. Held
         # until there is a frame's worth, then queued as one piece — still only
@@ -243,6 +295,19 @@ class Microphone:
         # modulo the decimation factor.
         out = filtered[self._phase :: self._decim]
         self._phase = (self._phase - len(filtered)) % self._decim
+        # Clip, do not wrap. A low-pass overshoots on transients — measured,
+        # this one reaches 136% of full scale on a full-scale square wave and
+        # 100.4% on a plain full-scale tone — and `astype` on an out-of-range
+        # float wraps, turning a sample near +32767 into one near -32768. That
+        # is a full-amplitude sign inversion, i.e. a loud click, landing on
+        # exactly the loudest phonemes. Not theoretical on this hardware: of 73
+        # real captures the median peaks at 6776 but one already sits at 32767,
+        # because the USB mic has no headroom management and a plosive from
+        # close range reaches the rail.
+        np.clip(out, -32768, 32767, out=out)
+        clipped = int(np.count_nonzero(np.abs(out) >= 32767))
+        if clipped:
+            self._clipped_samples += clipped
         return out.astype(np.int16)
 
     def _reset_resampler(self) -> None:
@@ -272,14 +337,29 @@ class Microphone:
         return self
 
     def __exit__(self, *exc) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if self._stream is None:
+            return
+        stream, self._stream = self._stream, None
+        try:
+            # close() even if stop() throws. Skipping it leaks the ALSA handle
+            # for the life of the process, and the device allows one reader —
+            # so the next thing to want the microphone cannot have it.
+            stream.stop()
+        finally:
+            stream.close()
 
     def _restart(self) -> bool:
-        """Reopen the stream after it has stopped delivering."""
-        log.warning("microphone stopped delivering audio; reopening")
+        """Reopen the stream after it has stopped delivering.
+
+        Failures are logged once, not once per attempt. A microphone that has
+        been unplugged is not coming back on its own, and the retry loop below
+        will keep trying for as long as the assistant runs — at one line per
+        attempt that is thousands of identical entries in the journal, which
+        buries whatever else went wrong that night.
+        """
+        first = self._restart_failures == 0
+        log.log(logging.WARNING if first else logging.DEBUG,
+                "microphone stopped delivering audio; reopening")
         try:
             if self._stream is not None:
                 self._stream.close()
@@ -290,9 +370,15 @@ class Microphone:
             self.device = find_input_device(self.cfg.device_match)
             self.__enter__()
             self._reset_resampler()
+            if self._restart_failures:
+                log.warning("microphone recovered after %d failed attempts",
+                            self._restart_failures)
+            self._restart_failures = 0
             return True
         except Exception as exc:
-            log.error("could not reopen the microphone: %s", exc)
+            self._restart_failures += 1
+            log.log(logging.ERROR if first else logging.DEBUG,
+                    "could not reopen the microphone: %s", exc)
             return False
 
     def frames(self) -> Iterator[np.ndarray]:
@@ -307,9 +393,11 @@ class Microphone:
         n = self.cfg.frame_samples
         residual = np.empty(0, dtype=np.int16)
         seen_dropped = self._dropped_samples
+        seen_clipped = self._clipped_samples
         last_get = time.monotonic()
         overrun_samples = 0
         last_report = last_get
+        backoff = RESTART_BACKOFF_S
         while True:
             try:
                 # A bare get() blocks forever, which is how a dead input
@@ -319,8 +407,17 @@ class Microphone:
                 # importantly, visible in the journal.
                 block = self._q.get(timeout=STALL_TIMEOUT_S)
             except queue.Empty:
-                if not self._restart():
-                    time.sleep(1.0)
+                if self._restart():
+                    backoff = RESTART_BACKOFF_S
+                else:
+                    # Back off rather than hammering. A missing microphone
+                    # cannot be retried into existence, and at a fixed one
+                    # second this spun for as long as the assistant ran.
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, MAX_RESTART_BACKOFF_S)
+                # The new stream shares nothing with the old one, so neither
+                # does the partial frame left over from it.
+                residual = np.empty(0, dtype=np.int16)
                 seen_dropped = self._dropped_samples
                 last_get = last_report = time.monotonic()
                 overrun_samples = 0
@@ -336,10 +433,21 @@ class Microphone:
             seen_dropped = self._dropped_samples
             last_get = now
 
-            if overrun_samples and now - last_report >= OVERRUN_REPORT_S:
-                log.warning("audio overrun: %.0f ms of audio lost while consuming, last %.0f s",
-                            overrun_samples * 1000 / self.cfg.capture_rate,
-                            now - last_report)
+            # Everything the audio thread is not allowed to say for itself gets
+            # said here, on one interval, off the realtime path.
+            if now - last_report >= OVERRUN_REPORT_S:
+                if overrun_samples:
+                    log.warning("audio overrun: %.0f ms of audio lost while consuming, last %.0f s",
+                                overrun_samples * 1000 / self.cfg.capture_rate,
+                                now - last_report)
+                if self._status is not None:
+                    status, self._status = self._status, None
+                    log.warning("audio status: %s", status)
+                if self._clipped_samples > seen_clipped:
+                    log.warning("%d samples clipped at full scale in the last %.0f s — "
+                                "the microphone gain is too high, or the source is too close",
+                                self._clipped_samples - seen_clipped, now - last_report)
+                seen_clipped = self._clipped_samples
                 overrun_samples = 0
                 last_report = now
 
@@ -362,8 +470,14 @@ class Microphone:
                 discarded += len(self._q.get_nowait())
             except queue.Empty:
                 break
-        if discarded or self._dropped_samples:
+        # The counter only ever climbs, and readers keep their own baseline.
+        # Zeroing it from here was a read-modify-write racing the audio thread's
+        # `+=`, which is not atomic — the occasional increment simply vanished.
+        # It only ever cost an inaccurate diagnostic, but a counter that lies is
+        # worse than no counter when it is the thing you are debugging with.
+        dropped = self._dropped_samples - self._drain_baseline
+        self._drain_baseline = self._dropped_samples
+        if discarded or dropped:
             log.debug("drained %.0f ms of buffered audio, %.0f ms dropped while busy",
                       discarded * 1000 / self.cfg.capture_rate,
-                      self._dropped_samples * 1000 / self.cfg.capture_rate)
-        self._dropped_samples = 0
+                      dropped * 1000 / self.cfg.capture_rate)
