@@ -102,8 +102,10 @@ def main() -> int:
     endpointer = Endpointer(cfg.audio, cfg.vad)
     print(" ready\n")
 
-    print("  Say the wake word each time it says SPEAK. Say it as you normally")
-    print("  would — the point is to match how you actually talk to it.")
+    print("  Press Enter when you are ready, then say the wake word. Say it as")
+    print("  you normally would — the point is to match how you actually talk")
+    print("  to it. Nothing is recorded until you press Enter, so take as long")
+    print("  as you like between attempts; a rushed trial measures the rush.")
     print(f"\n  While you speak you will see: {GREEN}●{RESET}/{DIM}○{RESET} voice detected,"
           f" a level meter, and the live transcript.")
     print(f"  {DIM}If the level bar barely moves, move closer or speak up. If the"
@@ -111,29 +113,49 @@ def main() -> int:
           f" prompt.{RESET}\n")
 
     TRIALS_DIR.mkdir(parents=True, exist_ok=True)
+    # Clear first. Trials are named by number and verdict, so a run where trial
+    # 3 flipped from hit to miss left 03-hit.wav behind next to the new
+    # 03-miss.wav, and anything reading the directory afterwards scored two
+    # runs as one — which is how a 27-trial run was once reported as 50
+    # recordings at 52%.
+    stale = sorted(TRIALS_DIR.glob("*.wav"))
+    for path in stale:
+        path.unlink()
+    if stale:
+        print(f"  {DIM}cleared {len(stale)} recording(s) from the last run{RESET}\n")
     results: list[tuple[bool, float, str, str]] = []
     negatives: list[tuple[bool, float, str, str]] = []
     heard_counter: collections.Counter[str] = collections.Counter()
 
-    def attempt(prefix):
+    def attempt(prefix, ready=""):
         """Record one utterance and put it through the real detector.
 
         Returns (hit, score, text, window, audio), or None if nothing was said.
 
-        Do NOT drain before this. Draining between trials was the cause of
-        every miss in two consecutive runs: a person settles into a rhythm and
-        starts the next attempt while the previous result is still being
-        written, so the discarded audio is the *beginning* of the phrase.
-        小爱同学 then arrives as 哎同学, 同学, or a fragment like 跑 —
-        front-truncated, 1.55 s against 2.41 s for a clean capture. Moving the
-        drain before the prompt narrowed the window but did not close it,
-        because the speech starts before the prompt exists.
+        **Waits for the human before listening.** This used to print a prompt
+        and start recording in the same instant, which works for one memorised
+        phrase and falls apart the moment there is something to read: in the
+        false-alarm phase every capture came out one trial behind, because the
+        speaker was still reading the previous sentence when the next prompt
+        replaced it. The run scored a false alarm of 1.00 on 他是我的老同学 by
+        recording the wake word from the phase before, and the report then
+        announced that the wake word fires on ordinary speech. It does not. A
+        measurement tool that races its subject measures the race.
 
-        Keeping the buffer means anything said early is still there when
-        collect() runs. The endpointer waits for speech onset regardless, and
-        the residue from the previous turn is the trailing silence it already
-        consumed.
+        An earlier version also refused to drain here, and was right to at the
+        time: with no way to know when the speaker was ready, audio arriving
+        before the prompt was the only protection against front-truncating
+        someone who had settled into a rhythm — 小爱同学 arriving as 哎同学 or
+        a fragment like 跑. Once readiness is signalled explicitly that reason
+        is gone, and draining is strictly better: nothing said before Enter can
+        be mistaken for the attempt that follows it.
         """
+        if ready:
+            try:
+                input(ready)
+            except EOFError:
+                pass                       # not a terminal; fall through
+        mic.drain()
         print(prefix + "…", end="", flush=True)
 
         # Live view of what the microphone is picking up, so speaking can be
@@ -195,7 +217,9 @@ def main() -> int:
         trial = 0
         while trial < args.trials:
             trial += 1
-            outcome = attempt(f"  [{trial:2}/{args.trials}] {GREEN}SPEAK{RESET} ")
+            outcome = attempt(
+                f"  [{trial:2}/{args.trials}] {GREEN}SPEAK{RESET} ",
+                ready=f"  [{trial:2}/{args.trials}] {DIM}Enter when ready…{RESET}")
             if outcome is None:
                 print(f"{YELLOW}nothing heard — trying again{RESET}")
                 trial -= 1  # a silent timeout is not an attempt
@@ -223,7 +247,11 @@ def main() -> int:
             for index, phrase in enumerate(NEGATIVES, 1):
                 prefix = (f"  [{index:2}/{len(NEGATIVES)}] {YELLOW}SAY{RESET} "
                           f"{phrase}  ")
-                outcome = attempt(prefix)
+                # Read it first, then press Enter, then say it. Each of these
+                # is a different sentence, which is exactly the case the old
+                # unpaced prompt could not survive.
+                outcome = attempt(prefix, ready=f"  {DIM}read “{phrase}” — "
+                                                f"Enter when ready…{RESET}")
                 if outcome is None:
                     print(f"{DIM}nothing heard — skipped{RESET}")
                     continue
