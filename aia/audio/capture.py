@@ -85,6 +85,30 @@ class Microphone:
     at every boundary, 33 times a second. Neither is visible in casual testing
     and both quietly degrade recognition, so the filter state (`_zi`) is
     carried across calls.
+
+    **So does the decimation phase, for the same reason and at greater cost.**
+    Taking every third sample of each block independently — `filtered[::3]` —
+    is only correct when every block length divides by 3. This device's do not.
+    Measured over 6 s it delivers `{417: 423, 15: 91, 16: 57, 14: 37}`, and
+    while 417 is 3x139, the 14s and 16s are 15.5% of all blocks and shift the
+    output sample grid by a sample or two every time. The shift is never
+    corrected, so the stream picks up a phase discontinuity about sixteen times
+    a second.
+
+    That is not a subtle degradation. Signal-to-spurious ratio of a tone
+    through this path, before and after carrying the phase:
+
+                  per-block phase    carried phase
+        300 Hz         29.0 dB          47.2 dB
+        1 kHz          18.5 dB          90.7 dB
+        3 kHz           7.2 dB         103.1 dB
+        5 kHz           4.5 dB          94.0 dB
+
+    At 3 kHz — where the consonants are — the artefacts were nearly as loud as
+    the speech. It also ran the clock 0.21% fast, 7.6 s per hour. Every
+    recognition threshold in this project predates the fix, so anything tuned
+    against captured audio (the wake phrase variants above all) is worth
+    re-measuring rather than trusting.
     """
 
     def __init__(self, cfg: AudioConfig):
@@ -108,6 +132,9 @@ class Microphone:
         # output, and above the ~7 kHz that carries any useful speech energy.
         self._sos = butter(8, 7200, btype="low", fs=cfg.capture_rate, output="sos")
         self._zi = sosfilt_zi(self._sos) * 0.0
+        # Index within the next block that continues the output sample grid.
+        # See the class docstring: this is as load-bearing as `_zi`.
+        self._phase = 0
 
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -129,7 +156,23 @@ class Microphone:
 
     def _downsample(self, block: np.ndarray) -> np.ndarray:
         filtered, self._zi = sosfilt(self._sos, block.astype(np.float32), zi=self._zi)
-        return filtered[:: self._decim].astype(np.int16)
+        # Keep one output grid across the whole stream rather than restarting it
+        # per block. `_phase` is where this block's first kept sample sits; after
+        # consuming `len(filtered)` samples the next one moves back by that much,
+        # modulo the decimation factor.
+        out = filtered[self._phase :: self._decim]
+        self._phase = (self._phase - len(filtered)) % self._decim
+        return out.astype(np.int16)
+
+    def _reset_resampler(self) -> None:
+        """Forget filter and phase state, for when the stream is discontinuous.
+
+        Carrying either across a reopened device would apply state from before
+        the gap to audio after it, which is the thing this whole mechanism
+        exists to avoid within a stream.
+        """
+        self._zi = sosfilt_zi(self._sos) * 0.0
+        self._phase = 0
 
     def __enter__(self) -> "Microphone":
         self._stream = sd.InputStream(
@@ -165,6 +208,7 @@ class Microphone:
         try:
             self.device = find_input_device(self.cfg.device_match)
             self.__enter__()
+            self._reset_resampler()
             return True
         except Exception as exc:
             log.error("could not reopen the microphone: %s", exc)
