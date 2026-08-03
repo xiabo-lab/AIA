@@ -69,6 +69,15 @@ LISTENING_TEXT = {"en": "Listening…", "zh": "我在听…"}
 # holding the floor and no wake word is needed.
 CONFIRM_LISTEN = {"en": "Say yes or no…", "zh": "请回答“确定”或“取消”…"}
 
+# After a turn that captured nothing, ignore the wake word for this long.
+# A wake word that fires on silence — a false positive, or AIA_NO_WAKE=1 where
+# anything counts — otherwise loops: open a turn, wait out `max_wait_ms`, close
+# it, open another. Each pass ducks and un-ducks whatever is playing and spawns
+# playerctl processes to do it, so the failure is audible and unbounded rather
+# than merely wasteful. Short enough that a genuine second attempt straight
+# after a false one is not swallowed.
+EMPTY_TURN_REFRACTORY_S = 1.0
+
 _YES = ("yes", "yeah", "yep", "sure", "confirm", "do it", "go ahead", "ok", "okay",
         "是", "是的", "对", "确定", "确认", "好", "好的", "可以", "没错")
 _NO = ("no", "nope", "cancel", "stop", "don't", "never mind", "abort",
@@ -139,7 +148,7 @@ def main() -> int:
         log.info("plugin %s: %s", plugin.name,
                  "available" if plugin.available() else "NOT reachable right now")
 
-    detector = wake_mod.build(cfg.wake)
+    detector = wake_mod.build(cfg.wake, cfg.audio)
     endpointer = Endpointer(cfg.audio, cfg.vad)
     # Answering a question takes longer than starting a command — the user has
     # to hear it, understand it, and decide. The normal 4 s window would time
@@ -163,10 +172,15 @@ def main() -> int:
     with Microphone(cfg.audio) as mic:
         frames = mic.frames()
         log.info("AIA ready — say the wake word")
+        last_empty_turn = 0.0
 
         while not stopping:
             frame = next(frames)
             if not detector.detect(frame):
+                continue
+            if time.monotonic() - last_empty_turn < EMPTY_TURN_REFRACTORY_S:
+                # The last turn heard nothing, so this is almost certainly the
+                # same non-event firing again. See EMPTY_TURN_REFRACTORY_S.
                 continue
 
             turn = machine.begin_turn()
@@ -203,6 +217,7 @@ def main() -> int:
                 panel.hide()
                 detector.reset()
                 machine.end_turn()
+                last_empty_turn = time.monotonic()
                 continue
 
             machine.to(State.THINKING)
@@ -337,6 +352,7 @@ def main() -> int:
                 # assistant does not hear itself.
                 mic.drain()
 
+    detector.close()
     speaker.close()
     panel.close()
     return 0

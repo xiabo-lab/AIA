@@ -74,7 +74,16 @@ class WakeConfig:
     #
     # These are compared by *sound*, so they only need to cover genuinely
     # different pronunciations, not different spellings: 哎同学 also matches
-    # 唉同学 and 爱同学 for free.
+    # 唉同学 and 爱同学 for free. Duplicates by sound are collapsed at startup,
+    # so listing both 小爱同学 and 小艾同学 costs nothing but is also worth
+    # nothing — these four are two targets.
+    #
+    # Do not add a variant shorter than three syllables, and do not expect the
+    # threshold alone to keep a three-syllable one safe. 爱同学 is only one
+    # syllable away from 同学, which is ordinary speech, so the matcher
+    # additionally requires the phrase's *first* syllable to have been heard.
+    # See `_covers_onset` in aia/audio/wake.py — without that guard 同学 scores
+    # 0.875 here and the assistant wakes up on conversation.
     variants: tuple[str, ...] = ("小爱同学", "小艾同学", "哎同学", "爱同学")
 
     # How closely the tail of what was heard must *sound* like the phrase.
@@ -85,6 +94,8 @@ class WakeConfig:
     # accepts roughly one wrong syllable in four. Measure before changing it —
     # scripts/wake_test.py reports the score of every attempt, so the right
     # value for a given voice and room is something to read off, not guess.
+    # Its second phase reads ordinary sentences and reports what they score;
+    # that number, not this one, is what says whether a change is safe.
     similarity: float = 0.72
 
     vosk_model: Path = MODELS / "vosk-model-small-cn-0.22"

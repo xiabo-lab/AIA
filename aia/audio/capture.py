@@ -26,6 +26,14 @@ log = logging.getLogger(__name__)
 # busy turn.
 STALL_TIMEOUT_S = 5.0
 
+# Blocks are dropped whenever nothing is reading the queue, which is normal for
+# the duration of a turn — that audio is stale and would be drained anyway. It
+# is *not* normal while frames are being consumed steadily: that means the wake
+# word cannot keep up with real time, and the audio it does see is spliced
+# across the gap. The two cases are told apart by how long the consumer took to
+# come back for the next block; anything under this was consuming steadily.
+CONSUMING_GAP_S = 0.5
+
 
 def find_input_device(match: str) -> int:
     """Index of the first input device whose name contains `match`.
@@ -173,6 +181,8 @@ class Microphone:
         """
         n = self.cfg.frame_samples
         residual = np.empty(0, dtype=np.int16)
+        seen_dropped = self._dropped
+        last_get = time.monotonic()
         while True:
             try:
                 # A bare get() blocks forever, which is how a dead input
@@ -184,7 +194,21 @@ class Microphone:
             except queue.Empty:
                 if not self._restart():
                     time.sleep(1.0)
+                seen_dropped = self._dropped
+                last_get = time.monotonic()
                 continue
+
+            now = time.monotonic()
+            if self._dropped > seen_dropped and now - last_get < CONSUMING_GAP_S:
+                # Losing audio while somebody is actively reading it. See
+                # CONSUMING_GAP_S — this is the overrun that shows up as the
+                # wake word mysteriously missing, so it is a warning and not a
+                # counter nobody reads.
+                log.warning("audio overrun: %d blocks lost while consuming",
+                            self._dropped - seen_dropped)
+            seen_dropped = self._dropped
+            last_get = now
+
             residual = np.concatenate([residual, self._downsample(block)])
             while len(residual) >= n:
                 yield residual[:n]
