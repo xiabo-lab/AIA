@@ -42,7 +42,14 @@ class AudioConfig:
 
     @property
     def capture_block(self) -> int:
-        # Capture in whole output frames so decimation never straddles a block.
+        """One output frame's worth of audio, at the capture rate.
+
+        This is *not* a blocksize to ask PortAudio for — doing that loses a
+        fifth of all audio on this device, see `Microphone`. It is the size the
+        capture callback coalesces the device's ragged blocks up to before
+        queueing them, which is what lets the queue be bounded by duration
+        instead of by a block count that means nothing.
+        """
         return self.capture_rate * self.frame_ms // 1000
 
 

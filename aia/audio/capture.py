@@ -43,6 +43,18 @@ CONSUMING_GAP_S = 0.5
 # dead. So the count is accumulated and reported on an interval.
 OVERRUN_REPORT_S = 5.0
 
+# How much audio the queue is allowed to hold. Sized against the consumer's
+# worst case rather than its average: measured live on this Pi the wake word
+# takes 0.30 ms on a median frame but 60 ms at p99 and 286 ms at worst, because
+# Vosk's decoder finalises in bursts. Anything the queue cannot ride out is
+# audio deleted from the middle of the stream, which is a missed wake word with
+# nothing in the journal to explain it. A second is ~3.5x the worst spike seen.
+#
+# Depth costs nothing here. The queue only fills when a consumer stalls — in
+# steady state the wake word empties it every frame — and `drain()` clears it at
+# every turn boundary, so a deeper queue cannot turn into stale backlog.
+QUEUE_SECONDS = 1.0
+
 
 def find_input_device(match: str) -> int:
     """Index of the first input device whose name contains `match`.
@@ -88,6 +100,17 @@ class Microphone:
     whatever size it likes, which is why `frames()` below re-frames them into
     the fixed-size frames the VAD and wake word require.
 
+    **What it likes is not one size.** Measured over 6 s this device delivered
+    `{417: 423, 15: 91, 16: 57, 14: 37}` — mostly 8.7 ms blocks, but nearly a
+    third of them a third of a millisecond. That is fine for re-framing and
+    ruinous for anything that counts blocks and believes the number means
+    something. The queue did: thirty-two blocks is 278 ms of audio when they
+    are large and 9 ms when they are small, against a consumer that stalls for
+    up to 286 ms while Vosk finalises. So the callback coalesces up to one
+    frame's worth before queueing, which costs no latency — a frame is complete
+    only when its last sample arrives, either way — and makes the queue depth
+    mean a duration.
+
     **The anti-alias filter keeps its state between blocks.** Decimating
     without a low-pass folds everything above 8 kHz back down into the speech
     band; filtering each block independently instead introduces a discontinuity
@@ -123,12 +146,24 @@ class Microphone:
     def __init__(self, cfg: AudioConfig):
         self.cfg = cfg
         self.device = find_input_device(cfg.device_match)
-        # Holds raw capture-rate blocks; the consumer downsamples. Deliberately
-        # shallow: a wake-word system always wants near-live audio, and a deep
-        # queue just means that after a busy turn the next one is spent
-        # chewing through stale backlog instead of listening.
-        self._q: queue.Queue[np.ndarray] = queue.Queue(maxsize=32)
-        self._dropped = 0
+
+        # Holds capture-rate audio; the consumer downsamples. Bounding this by a
+        # count of *blocks* bounds it by nothing useful, because the device does
+        # not deliver blocks of one size — measured over 6 s it produced
+        # {417: 423, 15: 91, 16: 57, 14: 37}. Thirty-two of those is 278 ms of
+        # audio if they all happen to be large and 9 ms if they all happen to be
+        # small, so the safety margin against a stalled consumer was a lottery,
+        # and the small blocks kept winning it. The callback coalesces to one
+        # frame's worth first, and the depth is then a duration.
+        self._chunk = cfg.capture_block
+        self._pending: list[np.ndarray] = []
+        self._pending_samples = 0
+        self._q: queue.Queue[np.ndarray] = queue.Queue(
+            maxsize=max(4, round(QUEUE_SECONDS * cfg.capture_rate / self._chunk)))
+        # Counted in samples, not blocks: a "block" is no longer a fixed amount
+        # of anything, and milliseconds of lost audio is the number that means
+        # something to whoever reads the log line.
+        self._dropped_samples = 0
         self._stream: sd.InputStream | None = None
         self._decim = cfg.capture_rate // cfg.target_rate
         if cfg.capture_rate % cfg.target_rate:
@@ -148,20 +183,38 @@ class Microphone:
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
             # Overflow means a consumer is too slow. Log rather than raise:
-            # dropping a block is far better than killing the assistant's only
+            # dropping audio is far better than killing the assistant's only
             # microphone.
             log.warning("audio status: %s", status)
+
+        # copy() because PortAudio reuses this buffer after we return. Held
+        # until there is a frame's worth, then queued as one piece — still only
+        # copying, which is all this thread is allowed to do, but it means the
+        # queue holds a predictable amount of time rather than a lottery.
+        # Chunks come out between `_chunk` and `_chunk` plus one device block,
+        # so the depth calculation is tight enough to trust.
+        #
+        # This costs no latency: a frame is only complete once its last sample
+        # has arrived either way. Coalescing moves where the assembly happens,
+        # not when it finishes.
+        self._pending.append(indata[:, 0].copy())
+        self._pending_samples += frames
+        if self._pending_samples < self._chunk:
+            return
+
+        chunk = (self._pending[0] if len(self._pending) == 1
+                 else np.concatenate(self._pending))
+        self._pending.clear()
+        self._pending_samples = 0
         try:
-            # copy() because PortAudio reuses this buffer after we return.
-            self._q.put_nowait(indata[:, 0].copy())
+            self._q.put_nowait(chunk)
         except queue.Full:
             # The queue fills on every turn — nothing consumes audio while the
             # STT request is in flight — so this is normal, not exceptional.
-            # It is summarised on drain rather than logged per block: at ~47
-            # blocks a second it produced thousands of lines per turn, which
-            # buried the actual failure in the journal and cost real I/O in
-            # the middle of the latency budget.
-            self._dropped += 1
+            # It is summarised by the consumer rather than logged here: this is
+            # a realtime thread, and at the rate overruns arrive the logging
+            # was costing more than the fault.
+            self._dropped_samples += len(chunk)
 
     def _downsample(self, block: np.ndarray) -> np.ndarray:
         filtered, self._zi = sosfilt(self._sos, block.astype(np.float32), zi=self._zi)
@@ -234,9 +287,9 @@ class Microphone:
         """
         n = self.cfg.frame_samples
         residual = np.empty(0, dtype=np.int16)
-        seen_dropped = self._dropped
+        seen_dropped = self._dropped_samples
         last_get = time.monotonic()
-        overrun_blocks = 0
+        overrun_samples = 0
         last_report = last_get
         while True:
             try:
@@ -249,25 +302,26 @@ class Microphone:
             except queue.Empty:
                 if not self._restart():
                     time.sleep(1.0)
-                seen_dropped = self._dropped
+                seen_dropped = self._dropped_samples
                 last_get = last_report = time.monotonic()
-                overrun_blocks = 0
+                overrun_samples = 0
                 continue
 
             now = time.monotonic()
-            if self._dropped > seen_dropped and now - last_get < CONSUMING_GAP_S:
+            if self._dropped_samples > seen_dropped and now - last_get < CONSUMING_GAP_S:
                 # Losing audio while somebody is actively reading it. See
                 # CONSUMING_GAP_S — this is the overrun that shows up as the
                 # wake word mysteriously missing, so it is worth a warning and
                 # not a counter nobody reads. Counted here, said below.
-                overrun_blocks += self._dropped - seen_dropped
-            seen_dropped = self._dropped
+                overrun_samples += self._dropped_samples - seen_dropped
+            seen_dropped = self._dropped_samples
             last_get = now
 
-            if overrun_blocks and now - last_report >= OVERRUN_REPORT_S:
-                log.warning("audio overrun: %d blocks lost while consuming in the last %.0f s",
-                            overrun_blocks, now - last_report)
-                overrun_blocks = 0
+            if overrun_samples and now - last_report >= OVERRUN_REPORT_S:
+                log.warning("audio overrun: %.0f ms of audio lost while consuming, last %.0f s",
+                            overrun_samples * 1000 / self.cfg.capture_rate,
+                            now - last_report)
+                overrun_samples = 0
                 last_report = now
 
             residual = np.concatenate([residual, self._downsample(block)])
@@ -286,11 +340,11 @@ class Microphone:
         discarded = 0
         while True:
             try:
-                self._q.get_nowait()
-                discarded += 1
+                discarded += len(self._q.get_nowait())
             except queue.Empty:
                 break
-        if discarded or self._dropped:
-            log.debug("drained %d buffered blocks, %d dropped while busy",
-                      discarded, self._dropped)
-        self._dropped = 0
+        if discarded or self._dropped_samples:
+            log.debug("drained %.0f ms of buffered audio, %.0f ms dropped while busy",
+                      discarded * 1000 / self.cfg.capture_rate,
+                      self._dropped_samples * 1000 / self.cfg.capture_rate)
+        self._dropped_samples = 0
