@@ -35,6 +35,21 @@ class Endpointer:
         self.vad = webrtcvad.Vad(cfg.aggressiveness)
         self._frame_ms = audio.frame_ms
 
+    def _fresh_vad(self) -> None:
+        """Start each utterance from the same state as every other one.
+
+        `webrtcvad.Vad` adapts to what it has heard, and the assistant holds two
+        of these — one for commands and one for confirmations. The confirmation
+        one runs rarely, so its adaptation was always minutes stale by the time
+        it mattered, which is the single moment that must not misfire: it
+        decides whether an irreversible action goes ahead.
+
+        Constructing one is trivial, and starting fresh also makes the decision
+        reproducible, so scripts/wake_test.py replaying a recording reaches the
+        same verdict the live loop did.
+        """
+        self.vad = webrtcvad.Vad(self.cfg.aggressiveness)
+
     def _is_speech(self, frame: np.ndarray) -> bool:
         # webrtcvad wants exactly 10/20/30 ms of 16-bit mono PCM. A short
         # trailing frame from the queue would raise, so treat it as silence.
@@ -67,8 +82,19 @@ class Endpointer:
 
         **Minimum speech.** Even after a real start, an utterance is not
         allowed to end until it contains at least `min_speech_ms` of actual
-        voiced audio. Otherwise a cough, a door, or the tail of the wake word
-        can still end the turn before the command arrives.
+        voiced audio, of which `min_run_ms` is unbroken. Otherwise a cough, a
+        door, or the tail of the wake word can still end the turn before the
+        command arrives.
+
+        The unbroken part is not decoration. Total voiced time is a sum over
+        the whole capture, so a scatter of unrelated noises adds up to a
+        command; one missed recording held 330 ms of speech whose longest
+        continuous stretch was 150 ms. Real phrases here run 1260 ms unbroken.
+
+        Falling short of either bar does not end the turn — the loop keeps
+        listening, up to `max_wait_ms` of silence. That is the whole point: the
+        failure being fixed was a breath ending the capture a second before the
+        command was spoken, and the cure is to still be listening when it is.
         """
         collected: list[np.ndarray] = []
         preroll: list[np.ndarray] = []
@@ -76,8 +102,11 @@ class Endpointer:
         waited_ms = 0
         onset_ms = 0
         speech_ms = 0
+        run_ms = 0
+        longest_run_ms = 0
         started = False
 
+        self._fresh_vad()
         preroll_frames = max(1, self.cfg.preroll_ms // self._frame_ms)
 
         for frame in frames:
@@ -98,7 +127,7 @@ class Endpointer:
                 if onset_ms >= self.cfg.onset_ms:
                     started = True
                     collected = list(preroll)
-                    speech_ms = onset_ms
+                    speech_ms = run_ms = longest_run_ms = onset_ms
                 elif waited_ms >= self.cfg.max_wait_ms:
                     log.info("no speech after wake word (%d ms)", waited_ms)
                     return None
@@ -107,11 +136,21 @@ class Endpointer:
             collected.append(frame)
             if speech:
                 speech_ms += self._frame_ms
+                run_ms += self._frame_ms
+                longest_run_ms = max(longest_run_ms, run_ms)
                 silence_ms = 0
             else:
                 silence_ms += self._frame_ms
+                run_ms = 0
 
-            if silence_ms >= self.cfg.silence_ms and speech_ms >= self.cfg.min_speech_ms:
+            # Not ending on a pause unless what came before it looks like
+            # something a person said on purpose. Falling short here does not
+            # end the turn — the loop simply keeps listening, which is what
+            # gives the real command, arriving a second after somebody cleared
+            # their throat, somewhere to land.
+            if (silence_ms >= self.cfg.silence_ms
+                    and speech_ms >= self.cfg.min_speech_ms
+                    and longest_run_ms >= self.cfg.min_run_ms):
                 break
             if len(collected) * self._frame_ms >= self.cfg.max_utterance_ms:
                 log.warning("utterance hit the %d ms cap", self.cfg.max_utterance_ms)
@@ -119,13 +158,16 @@ class Endpointer:
             # Started on something that turned out not to be speech: give up
             # waiting rather than sitting here until the hard cap.
             if silence_ms >= self.cfg.max_wait_ms:
-                log.info("utterance stalled with only %d ms of speech", speech_ms)
+                log.info("utterance stalled with only %d ms of speech (%d ms unbroken)",
+                         speech_ms, longest_run_ms)
                 return None
 
-        if not collected or speech_ms < self.cfg.min_speech_ms:
-            log.info("discarding utterance with %d ms of speech", speech_ms)
+        if (not collected or speech_ms < self.cfg.min_speech_ms
+                or longest_run_ms < self.cfg.min_run_ms):
+            log.info("discarding utterance with %d ms of speech (%d ms unbroken)",
+                     speech_ms, longest_run_ms)
             return None
         audio = np.concatenate(collected)
-        log.info("utterance: %.2f s (%d ms voiced)",
-                 len(audio) / self.audio.target_rate, speech_ms)
+        log.info("utterance: %.2f s (%d ms voiced, %d ms unbroken)",
+                 len(audio) / self.audio.target_rate, speech_ms, longest_run_ms)
         return audio

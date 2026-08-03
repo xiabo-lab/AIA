@@ -142,12 +142,42 @@ class VadConfig:
     # An utterance must contain at least this much voiced audio before it is
     # allowed to end, or be discarded. Guards against a cough or a door ending
     # the turn before the command arrives.
-    min_speech_ms: int = 300
+    #
+    # It was 300 ms, which is about one syllable, and that is what it behaved
+    # like: measured across two runs of 27 trials, every missed capture held
+    # 300-660 ms of voiced audio while a real phrase holds 1140-1290 ms. Two
+    # misses in the last run held 300 and 330 ms — the guard exactly. A breath
+    # or a hesitation cleared it, the capture closed, and the command that
+    # followed was never heard.
+    #
+    # 500 ms still admits the shortest real command: at the ~320 ms per
+    # syllable these recordings show, 暂停 is around 640 ms. Raising it further
+    # would start cutting off genuine two-syllable commands, so this is a floor
+    # set by what people say, not by what noise happens to measure.
+    min_speech_ms: int = 500
+    # ...of which this much has to be *contiguous*. Total voiced time alone
+    # cannot tell a command from a scatter of unrelated noises across a few
+    # seconds, and one missed capture held 330 ms of speech whose longest
+    # unbroken run was 150 ms. Real phrases in these recordings run 1260 ms
+    # unbroken.
+    min_run_ms: int = 400
     # Audio kept from just before speech onset, so the first phoneme survives.
-    preroll_ms: int = 300
+    #
+    # 300 ms was less than the phrase it most needed to protect. At ~320 ms per
+    # syllable, 小爱 takes about 640 ms, so an onset detected even slightly
+    # late lost the head of the wake phrase and could not get it back — which
+    # is precisely the "leading 小 is dropped about half the time" that
+    # WakeConfig.variants exists to accommodate. Costs memory, not latency:
+    # these frames have already been captured either way.
+    preroll_ms: int = 700
     # Give up on an utterance that never ends, so a noisy room cannot pin the
     # assistant in listening mode forever.
-    max_utterance_ms: int = 12000
+    #
+    # Capped at what the transcriber will actually read rather than at a round
+    # number: SttConfig.audio_ctx of 512 gives Whisper 512 of its 1500 encoder
+    # positions, which is 512/1500 x 30 s = 10.2 s. Anything captured beyond
+    # that was being discarded downstream in silence.
+    max_utterance_ms: int = 10000
     # Bail out if the user says nothing at all after the wake word. This is
     # the window to start speaking, so it has to tolerate a normal pause.
     max_wait_ms: int = 4000
