@@ -34,6 +34,15 @@ STALL_TIMEOUT_S = 5.0
 # come back for the next block; anything under this was consuming steadily.
 CONSUMING_GAP_S = 0.5
 
+# How often that may be said out loud. Overruns arrive in bursts and per-burst
+# logging turns the report into part of the fault: writing a line costs time in
+# the very loop that is already failing to keep up, which drops more audio,
+# which logs another line. Under scripts/wake_test.py — whose live transcript
+# makes the consumer far heavier than the assistant's — that ran at nearly one
+# line per frame and, over ssh, blocked on the terminal until the tool stopped
+# dead. So the count is accumulated and reported on an interval.
+OVERRUN_REPORT_S = 5.0
+
 
 def find_input_device(match: str) -> int:
     """Index of the first input device whose name contains `match`.
@@ -227,6 +236,8 @@ class Microphone:
         residual = np.empty(0, dtype=np.int16)
         seen_dropped = self._dropped
         last_get = time.monotonic()
+        overrun_blocks = 0
+        last_report = last_get
         while True:
             try:
                 # A bare get() blocks forever, which is how a dead input
@@ -239,19 +250,25 @@ class Microphone:
                 if not self._restart():
                     time.sleep(1.0)
                 seen_dropped = self._dropped
-                last_get = time.monotonic()
+                last_get = last_report = time.monotonic()
+                overrun_blocks = 0
                 continue
 
             now = time.monotonic()
             if self._dropped > seen_dropped and now - last_get < CONSUMING_GAP_S:
                 # Losing audio while somebody is actively reading it. See
                 # CONSUMING_GAP_S — this is the overrun that shows up as the
-                # wake word mysteriously missing, so it is a warning and not a
-                # counter nobody reads.
-                log.warning("audio overrun: %d blocks lost while consuming",
-                            self._dropped - seen_dropped)
+                # wake word mysteriously missing, so it is worth a warning and
+                # not a counter nobody reads. Counted here, said below.
+                overrun_blocks += self._dropped - seen_dropped
             seen_dropped = self._dropped
             last_get = now
+
+            if overrun_blocks and now - last_report >= OVERRUN_REPORT_S:
+                log.warning("audio overrun: %d blocks lost while consuming in the last %.0f s",
+                            overrun_blocks, now - last_report)
+                overrun_blocks = 0
+                last_report = now
 
             residual = np.concatenate([residual, self._downsample(block)])
             while len(residual) >= n:
