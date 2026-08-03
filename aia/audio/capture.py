@@ -50,9 +50,11 @@ OVERRUN_REPORT_S = 5.0
 # audio deleted from the middle of the stream, which is a missed wake word with
 # nothing in the journal to explain it. A second is ~3.5x the worst spike seen.
 #
-# Depth costs nothing here. The queue only fills when a consumer stalls — in
-# steady state the wake word empties it every frame — and `drain()` clears it at
-# every turn boundary, so a deeper queue cannot turn into stale backlog.
+# Depth is safe to spend only because the queue evicts its oldest audio rather
+# than refusing new audio when it is full — see `_callback`. What it holds is
+# therefore always the most recent second, so a consumer that has been away
+# comes back to the live edge instead of to history. Without that, depth buys
+# stall tolerance at the price of staleness, and this number could not go up.
 QUEUE_SECONDS = 1.0
 
 
@@ -209,12 +211,29 @@ class Microphone:
         try:
             self._q.put_nowait(chunk)
         except queue.Full:
-            # The queue fills on every turn — nothing consumes audio while the
-            # STT request is in flight — so this is normal, not exceptional.
-            # It is summarised by the consumer rather than logged here: this is
-            # a realtime thread, and at the rate overruns arrive the logging
-            # was costing more than the fault.
-            self._dropped_samples += len(chunk)
+            # Full means a consumer has been away longer than the queue is
+            # deep, and something has to go. It must be the *oldest* audio, not
+            # this chunk. Discarding the newest keeps a second of history and
+            # throws away what is being said right now, which is backwards for
+            # a system whose whole job is to notice that it is being spoken to
+            # — and it is not a theoretical preference: the endpointer, handed
+            # a stale second, finds speech in it, ends the utterance on it, and
+            # returns having captured the wrong moment entirely.
+            #
+            # The queue fills on every turn, because nothing reads audio while
+            # the STT request is in flight, so this path is ordinary rather
+            # than exceptional. Nothing is logged from here: this is a realtime
+            # thread and at the rate overruns arrive the logging cost more than
+            # the fault. The consumer summarises instead.
+            try:
+                self._dropped_samples += len(self._q.get_nowait())
+            except queue.Empty:
+                pass  # a consumer beat us to it; there is room now either way
+            try:
+                self._q.put_nowait(chunk)
+            except queue.Full:
+                # Lost the race for the slot just freed. One chunk, next time.
+                self._dropped_samples += len(chunk)
 
     def _downsample(self, block: np.ndarray) -> np.ndarray:
         filtered, self._zi = sosfilt(self._sos, block.astype(np.float32), zi=self._zi)
