@@ -36,8 +36,8 @@ from aia.core.state import Machine, State
 from aia.plugins.base import Registry, Result
 from aia.plugins.kodama import KodamaLite
 from aia.plugins.system import System
-from aia.router.fast import FastRouter
-from aia.stt.engine import SpeechToText
+from aia.router.fast import FastRouter, normalise
+from aia.stt.engine import SpeechToText, detect_script
 from aia.tts.language import reply_language
 from aia.tts.piper import Speaker
 from aia.ui.panel import Panel
@@ -84,6 +84,21 @@ _NO = ("no", "nope", "cancel", "stop", "don't", "never mind", "abort",
        "不", "不要", "取消", "别", "算了", "不用")
 
 
+def _sounds(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The Chinese entries of a word list, as pinyin.
+
+    Only the Chinese ones. An English word left as itself would be compared
+    against pinyin, where it matches things it has no business matching — "no"
+    is inside 弄 (`nong`), "ok" is inside 多克 (`duoke`).
+    """
+    return tuple(dict.fromkeys(
+        s for s in (normalise(w) for w in words if detect_script(w) == "zh") if s))
+
+
+_YES_SOUNDS = _sounds(_YES)
+_NO_SOUNDS = _sounds(_NO)
+
+
 def is_affirmative(text: str) -> bool | None:
     """Yes, no, or neither.
 
@@ -95,11 +110,34 @@ def is_affirmative(text: str) -> bool | None:
     wake word can be transcribed into it too. Negatives are tested first
     because they contain affirmatives — 不确定 is a refusal, and checking
     yes-words first would read it as agreement.
+
+    **Chinese is compared by sound, not by character.** Whisper's Chinese
+    output is not stable in script: the same speaker saying the same 确定 into
+    the same microphone came back simplified three times and traditional
+    (確定) three times, in one evening. Character matching therefore answered
+    correctly about half the time, and since anything it fails to recognise is
+    treated as a refusal, the visible symptom was the assistant saying 已取消
+    to somebody who had just clearly said 确定 — twice in a row, to a shutdown
+    it had itself asked about.
+
+    Simplified and traditional are the same word to a listener and the same
+    pinyin to `normalise`, which is exactly why the wake word and the intent
+    router already compare this way. This was the one place still reading
+    characters, and the one place where getting it wrong silently drops an
+    action the user explicitly authorised.
     """
     stripped = text.strip().lower().rstrip(".!?。！？ ")
-    if any(word in stripped for word in _NO):
+    sound = normalise(stripped) if detect_script(stripped) == "zh" else ""
+
+    def said(words: tuple[str, ...], sounds: tuple[str, ...]) -> bool:
+        return (any(word in stripped for word in words)
+                or (bool(sound) and any(s in sound for s in sounds)))
+
+    # Every negative, in either form, before any affirmative — 不確定 must not
+    # be read as agreement whichever script it arrives in.
+    if said(_NO, _NO_SOUNDS):
         return False
-    if any(word in stripped for word in _YES):
+    if said(_YES, _YES_SOUNDS):
         return True
     return None
 
@@ -282,7 +320,9 @@ def main() -> int:
                     answer_audio = confirm_endpointer.collect(frames)
                     decision = None
                     if answer_audio is not None:
-                        answer = stt.listen(answer_audio)
+                        # In the language the question was asked in: we are
+                        # holding the floor, so there is nothing to detect.
+                        answer = stt.listen(answer_audio, language=lang)
                         if answer.text.strip():
                             panel.user(answer.text)
                             decision = is_affirmative(answer.text)

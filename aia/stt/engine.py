@@ -140,10 +140,24 @@ class SpeechToText:
             log.info("language lock on %r cleared", self.locked)
         self.locked = None
 
-    def listen(self, audio: np.ndarray) -> Transcript:
-        """Transcribe an utterance in the conversation's language."""
+    def listen(self, audio: np.ndarray, language: str | None = None) -> Transcript:
+        """Transcribe an utterance in the conversation's language.
+
+        `language` names it outright for this one utterance, for the case where
+        the caller genuinely knows better than the lock does. Answering a
+        question is that case: the assistant has just asked something out loud
+        in a particular language and is holding the floor for the reply, so the
+        reply is in that language and there is nothing to detect.
+
+        It matters because the alternative failed in the field. A one-word
+        confirmation is very little audio to identify a language from, and with
+        the lock idle, automatic detection rendered a spoken 确定 as 'Trading'
+        and as 'seting.' — English, twice, for the answer to a Chinese
+        question. Neither is a yes, so the shutdown was silently cancelled.
+        Naming the language is also ~390 ms cheaper, per the measurements above.
+        """
         wav = _wav_bytes(audio, self.rate)
-        result = self._transcribe(wav, self._current_language())
+        result = self._transcribe(wav, language or self._current_language())
 
         # Decoded in a language this assistant does not support. Redo it in a
         # supported one rather than handing the router text it can never
