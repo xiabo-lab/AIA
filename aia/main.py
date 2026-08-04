@@ -273,18 +273,24 @@ def main() -> int:
                 result = stt.listen(audio)
                 turn.mark("stt")
 
-                # Whisper emits this marker for a clip with no speech in it —
-                # it is not a transcript, and echoing it back is nonsense.
+                # The blank-audio marker is cleared in stt/engine.py, which is
+                # the only place that knows it is a whisper.cpp artefact.
                 text = result.text.strip()
-                if text.upper().strip("[]") == "BLANK_AUDIO":
-                    text = ""
 
                 if not text:
+                    # Apologise in the language of the last turn that *worked*,
+                    # not in `result.language`. Nothing was understood, so this
+                    # transcript has no language to report — it falls back to
+                    # the configured default, which is English, and a Mandarin
+                    # speaker who was misheard would be told "I'm sorry, could
+                    # you repeat that?". The last language they were understood
+                    # in is the best guess available, and this only picks a
+                    # voice; it does not affect how anything is transcribed.
                     machine.to(State.SPEAKING)
                     apology = ("I'm sorry, could you repeat that?"
-                               if result.language == "en" else "抱歉，请再说一遍。")
+                               if stt_language == "en" else "抱歉，请再说一遍。")
                     panel.aia(apology)
-                    speaker.say(apology, result.language)
+                    speaker.say(apology, stt_language)
                     machine.end_turn()
                     detector.reset()
                     mic.drain()

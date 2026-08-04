@@ -210,6 +210,15 @@ class SpeechToText:
 
         text = (payload.get("text") or "").strip()
 
+        # whisper.cpp emits this marker for a clip it found no speech in. It is
+        # not a transcript, and it must be cleared *here*, before anything below
+        # reads a language out of it: "[BLANK_AUDIO]" is ten Latin letters and
+        # no Han, so `detect_script` calls it English and a silent Mandarin turn
+        # gets answered in the wrong language. Callers used to strip it
+        # themselves, which was too late to help.
+        if text.upper().strip("[]") == "BLANK_AUDIO":
+            text = ""
+
         # Plain `json` carries no language field. `language` is what was
         # *asked for*, which for a locked conversation is already the answer;
         # when it was "auto", the script of the text says what Whisper chose.
