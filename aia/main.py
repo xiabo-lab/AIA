@@ -166,7 +166,11 @@ def main() -> int:
     cfg = CONFIG
     save_audio = os.environ.get("AIA_SAVE_AUDIO") == "1"
 
-    stt = SpeechToText(cfg.stt)
+    # The rate is passed, not defaulted. `SpeechToText` writes it into the WAV
+    # header, and a header that disagrees with the samples does not fail — it
+    # transcribes a pitch-shifted signal and returns confident nonsense. Same
+    # trap as the wake recogniser built at a hardcoded 16 kHz.
+    stt = SpeechToText(cfg.stt, cfg.audio.target_rate)
     log.info("waiting for whisper-server at %s", cfg.stt.url)
     if not stt.wait_ready():
         log.error("whisper-server never answered. Start it: ./scripts/run_services.sh start")

@@ -62,7 +62,7 @@ def main() -> int:
         format="%(levelname)-7s %(name)-18s %(message)s",
     )
 
-    stt = SpeechToText(CONFIG.stt)
+    stt = SpeechToText(CONFIG.stt, CONFIG.audio.target_rate)
     if not stt.wait_ready(timeout=30):
         print("whisper-server is not answering — ./scripts/run_services.sh start")
         return 1

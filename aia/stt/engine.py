@@ -139,7 +139,14 @@ class SpeechToText:
     `listen(..., language=...)` — see there.
     """
 
-    def __init__(self, cfg: SttConfig, rate: int = 16000):
+    def __init__(self, cfg: SttConfig, rate: int):
+        # `rate` is required, not defaulted. It was `= 16000` and both call
+        # sites omitted it, so the WAV header agreed with the samples only
+        # because AudioConfig.target_rate happened to be 16000 too. A header
+        # that disagrees does not fail: Whisper transcribes a pitch- and
+        # speed-shifted signal and returns confident wrong text, with nothing
+        # in the journal. The wake recogniser had the same bug against the
+        # same config field. Making it required is what stops it coming back.
         self.cfg = cfg
         self.rate = rate
         self._session = requests.Session()
