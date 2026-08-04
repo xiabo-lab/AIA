@@ -243,6 +243,17 @@ class SttConfig:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/inference"
 
+    @property
+    def readable_audio_ms(self) -> int:
+        """How much audio the encoder will actually look at, in ms.
+
+        Whisper's encoder runs at 50 positions per second — its full 1500 are
+        the padded 30 s window — so each position is 20 ms and `audio_ctx`
+        converts straight into a duration. `Config.__post_init__` uses this to
+        stop the capture cap drifting past it.
+        """
+        return self.audio_ctx * 20
+
 
 @dataclass(frozen=True)
 class TtsConfig:
@@ -273,6 +284,29 @@ class Config:
     # state machine logs a warning so regressions surface in the journal
     # rather than in someone's patience.
     target_latency_ms: int = 2500
+
+    def __post_init__(self) -> None:
+        """Check the invariants that span two config classes.
+
+        These are the ones a comment cannot enforce. `max_utterance_ms` was
+        capped at what Whisper will actually read, and the two numbers were
+        chosen together and written down in separate dataclasses — so raising
+        the capture cap without touching `audio_ctx` silently throws the extra
+        audio away *inside* Whisper, with a full transcript of the first ten
+        seconds coming back and nothing anywhere to say the rest was dropped.
+
+        Failing at import is deliberate. This can only be reached by editing
+        config.py, so it is a developer error caught the first time the
+        process starts, not something a user can trigger.
+        """
+        readable = self.stt.readable_audio_ms
+        if self.vad.max_utterance_ms > readable:
+            raise ValueError(
+                f"vad.max_utterance_ms={self.vad.max_utterance_ms} exceeds what "
+                f"whisper will read at stt.audio_ctx={self.stt.audio_ctx} "
+                f"({readable} ms). Audio past that is discarded silently. "
+                f"Raise audio_ctx or lower max_utterance_ms."
+            )
 
 
 CONFIG = Config()
