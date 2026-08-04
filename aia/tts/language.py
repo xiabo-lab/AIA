@@ -32,9 +32,12 @@ def reply_language(transcript_text: str, fallback: str = DEFAULT) -> str:
     """Language to answer in, inferred from what the user just said.
 
     Uses the script of the transcript rather than the language tag Whisper was
-    asked for, because the sticky-language scheme in stt/engine.py can ask for
-    the wrong one — and when it does, the script of the returned text is the
-    honest signal about what was actually spoken.
+    asked for. Those differ in the case that matters: a request for `auto`
+    reports no language at all in the fast `json` mode, and a caller that
+    named a language outright — the confirmation does — named the language of
+    the *question*, which is not necessarily the one the answer came back in.
+    The script of the returned text is the honest signal about what was
+    actually spoken.
     """
     detected = detect_script(transcript_text)
     if detected is None:

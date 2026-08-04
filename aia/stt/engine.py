@@ -227,12 +227,19 @@ class SpeechToText:
         if text.upper().strip("[]") == "BLANK_AUDIO":
             text = ""
 
-        # Plain `json` carries no language field. `language` is what was
-        # *asked for*, which for a locked conversation is already the answer;
-        # when it was "auto", the script of the text says what Whisper chose.
-        # `listen()` corrects this afterwards if the script disagrees.
+        # Best available answer, in descending order of how much it is worth.
+        # Plain `json` carries no language field, so `reported` is usually
+        # absent; `language` is only what was *asked for*, which says nothing
+        # when it was "auto"; and the script of the text is what Whisper
+        # actually produced. `listen()` overrides this afterwards when the
+        # script disagrees, which is the case that matters.
         reported = _LANG_NAMES.get(str(payload.get("language", "")).lower())
-        lang = (reported if reported in self.cfg.supported_languages else None)             or (language if language in self.cfg.supported_languages else None)             or detect_script(text) or self.cfg.default_language
+        lang = (
+            (reported if reported in self.cfg.supported_languages else None)
+            or (language if language in self.cfg.supported_languages else None)
+            or detect_script(text)
+            or self.cfg.default_language
+        )
 
         confidence = None
         if self.cfg.verbose:
