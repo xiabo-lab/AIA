@@ -384,6 +384,23 @@ def main() -> int:
             except Exception:
                 log.exception("turn failed")
                 machine.to(State.ERROR)
+                # Say so. A turn that dies here — whisper-server wedged or
+                # restarting is the realistic cause — used to end in silence:
+                # the wake word was acknowledged, the music ducked, "Listening…"
+                # stayed on screen, and then nothing ever came back. From the
+                # outside that is indistinguishable from the assistant having
+                # ignored you, and the only record was in the journal.
+                #
+                # Guarded, because this runs on the path where something has
+                # already gone wrong: if speaking fails too, the original
+                # exception is what matters and it has already been logged.
+                try:
+                    trouble = ("Sorry, something went wrong." if stt_language == "en"
+                               else "抱歉，出错了。")
+                    panel.aia(trouble)
+                    speaker.say(trouble, stt_language)
+                except Exception:
+                    log.exception("could not announce the failed turn")
             finally:
                 # Bring the music back, but only once the reply has finished
                 # speaking — resuming first would talk over the answer.

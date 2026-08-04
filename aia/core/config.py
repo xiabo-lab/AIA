@@ -222,6 +222,18 @@ class SttConfig:
     default_language: str = "en"
     supported_languages: tuple[str, ...] = ("en", "zh")
 
+    # How long to wait on the server before giving up. This is a bound on a
+    # hang, not a target: it must never abort a request that would have
+    # succeeded. Measured over 35 real captures with `base` and `-ac 512`,
+    # transcription is 1323 ms median and 1506 ms at p90, so this is ~6x p90.
+    #
+    # It was 30 s, hardcoded, and `listen()` can transcribe twice — so a
+    # wedged whisper-server held the assistant for a minute with the music
+    # ducked and "Listening…" on screen. Against a 2.5 s turn budget, a
+    # timeout that long is indistinguishable from a hang to the person
+    # standing there.
+    timeout_s: float = 10.0
+
     # Word-level probabilities (the spec's "transcription confidence score").
     # Off by default: it forces `verbose_json`, whose DTW alignment pass adds
     # another ~390 ms. Turn it on for diagnostics, not for the fast path.

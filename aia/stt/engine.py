@@ -210,7 +210,7 @@ class SpeechToText:
             self.cfg.url,
             files={"file": ("utterance.wav", wav, "audio/wav")},
             data={"response_format": fmt, "language": language},
-            timeout=30,
+            timeout=self.cfg.timeout_s,
         )
         resp.raise_for_status()
         payload = resp.json()
