@@ -201,28 +201,25 @@ class SttConfig:
     # and looping and total time goes back *up*, so 512 is a floor, not a knob.
     audio_ctx: int = 512
 
-    # Detect the spoken language per utterance. Costs ~390 ms versus naming a
-    # language outright, which buys the spec's "switch language freely mid
-    # conversation" requirement. A sticky-language scheme was built to avoid
-    # this cost and then removed — stt/engine.py's docstring records why, with
-    # the measurements. Turning this off makes AIA monolingual; it does not
-    # make it faster in any way worth having.
+    # Detect the spoken language on every utterance. Costs ~600 ms against
+    # naming one outright, measured over 35 real captures, and it is what
+    # lets a Mandarin command follow an English one with nothing to select.
+    #
+    # A sticky-language scheme held this for a whole conversation to avoid
+    # that cost. It was removed: Whisper does not fail on audio in a language
+    # it was not asked for, it silently *translates*, so the second language
+    # became five minutes of fluent unroutable English. stt/engine.py's
+    # docstring carries the measurements and the three cheaper schemes that
+    # were tried and rejected — including a bigger model, which is genuinely
+    # more accurate and four times too slow.
+    #
+    # Turning this off makes AIA monolingual. It does not make it faster in
+    # any way worth having.
     auto_detect: bool = True
-    default_language: str = "en"
 
-    # A conversation stays in the language it opened in. Only the first
-    # utterance is auto-detected; the rest name that language outright, which
-    # is both what a conversation actually is and ~390 ms faster per turn.
-    #
-    # It also removes the failure this was added for: automatic detection
-    # ranges over all 99 languages Whisper knows, and on Mandarin speech it
-    # returned Korean (총치) and Japanese (よいしょ, じゃあ) — untypeable by
-    # the router and unsupported by the assistant.
-    #
-    # The lock expires after this many seconds of no conversation, so
-    # switching language means pausing rather than restarting anything. Set
-    # to 0 to hold it until the process restarts.
-    lock_timeout_s: int = 300
+    # Only used when auto_detect is off, or when a transcript is empty and
+    # there is no script to read a language from.
+    default_language: str = "en"
     supported_languages: tuple[str, ...] = ("en", "zh")
 
     # Word-level probabilities (the spec's "transcription confidence score").

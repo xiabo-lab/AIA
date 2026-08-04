@@ -264,8 +264,8 @@ def main() -> int:
             # confirmation reply, and an exception raised before routing.
             intent = None
             try:
-                # Sticky language, with a confidence-triggered retry in the
-                # other one. See stt/engine.py for why confidence and not script.
+                # Detected fresh every turn, so the user can switch language
+                # between one command and the next. See stt/engine.py.
                 result = stt.listen(audio)
                 turn.mark("stt")
 

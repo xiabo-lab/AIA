@@ -7,41 +7,71 @@ isolates a crash in native code from the assistant process.
 
 ## Language handling
 
-Measured on this Pi 5, same clip, `-ac 512`:
+**Every utterance is detected on its own.** Say "play some music", then
+"播放音乐", then "play some music" again, and each is transcribed in the
+language it was spoken in. Nothing has to be selected, and there is no mode
+to be in.
 
-    json + explicit language     499 ms (en)   624 ms (zh)
-    json + auto                  877 ms (en)  1020 ms (zh)
-    verbose_json + auto         1268 ms (en)  1407 ms (zh)
+It did not used to work that way. A conversation detected its language once
+and then named it for everything after, on the reasoning that people do not
+change language mid-conversation and that naming it is faster. Both halves
+were wrong for this assistant. People here *do* switch — that is the whole
+point of a bilingual household — and the lock turned the second language into
+a failure that lasted five minutes.
 
-Naming the language is ~390 ms cheaper than `auto`, and `verbose_json` costs a
-further ~390 ms because it runs DTW alignment for word-level timestamps.
+The cost of being wrong is not a slightly worse transcript. Whisper does not
+fail when handed audio in a language it was not asked for; it quietly
+translates. Measured on 35 real captures, all Mandarin, forced through
+`language=en`:
 
-A conversation therefore detects its language **once** and then names it. The
-first version of this file tried a cleverer thing — transcribe in whatever was
-spoken last, and re-run when that turned out to be wrong — and it was removed,
-because nothing detects "wrong" cheaply:
+    下一首   -> 'Next one.'        关机 -> 'Guanji.'
+    前一首的 -> 'Money, brother.'  播放… -> '(Song)'
+                                        -> '(speaking in foreign language)'
 
-  * **Script does not work as a wrongness test.** Whisper emits text in the
-    script of the language you asked for. Mandarin audio forced through English
-    came back as fluent English prose — it quietly *translated* rather than
-    failing.
-  * **Confidence does not work reliably.** Mean word probability did separate
-    the bad case (0.17 vs 0.69), but only with temperature fallback enabled,
-    which is also what made that pass take **10.4 s**. Disabling fallback made
-    Whisper settle on a confident mistranslation instead (0.77, still 6.5 s).
-    And reading confidence at all requires `verbose_json`, whose +390 ms is the
-    entire saving.
+Fluent, confident, and unroutable. That is what a user hits on their first
+Mandarin command after an English one, and it is the reported symptom.
 
-What replaced it is not that scheme. There is no per-utterance guessing: the
-language is fixed for the conversation the moment the first utterance is
-understood, and only reconsidered after the conversation goes idle. That is
-both what a conversation is, and — the reason it was actually needed —
-containment. Automatic detection ranges over all 99 languages Whisper knows,
-and on this device it returned Korean (총치) and Japanese (よいしょ, じゃあ) for
-Mandarin speech. Naming the language removes the choice.
+## Why the lock was safe to remove
 
-The one residual guess is `detect_script(...) == "other"`, which catches a
-first utterance that was decoded into an unsupported language and redoes it.
+It was containment for a real problem: automatic detection ranges over all 99
+languages Whisper knows, and on this device it used to return Korean (총치)
+and Japanese (よいしょ, じゃあ) for Mandarin speech. That was measured on audio
+captured through the broken decimator. Re-measured on 35 captures taken after
+the phase fix: **0 decoded into an unsupported language.** The failure the
+lock existed to contain was a symptom of the capture bug, and it went with it.
+`detect_script(...) == "other"` stays as the net, and now catches nothing.
+
+## What it costs, and what was tried instead
+
+Measured over those same 35 captures, `ggml-base`, `-ac 512`, scored by
+whether the transcript routes to a command — the only accuracy metric that
+means anything here:
+
+    base   auto                  1323 ms median   27-28/35 routed
+    base   language named         725 ms median
+    base   q5_1 quantised        1663 ms median   28/35 routed
+    small  q5_1 auto             6627 ms median   32/35 routed
+    small  q5_1 language named   3403 ms median   32/35 routed
+    base   auto + primed vocab  16862 ms median   27/35 routed
+
+So detecting every utterance costs ~600 ms against naming one. Three attempts
+to avoid paying it, all rejected on measurement:
+
+  * **A bigger model.** `small` really is better — 32/35 against 28/35, which
+    is the Mandarin accuracy everyone wants — and it is 6.6 s per utterance
+    against a 2.5 s budget for the whole turn. Not close, even with the
+    language named.
+  * **Quantisation to buy that back.** `q5_1` is *slower* than `f16` on this
+    ARM core, at identical accuracy. There is no trade here to make.
+  * **Detecting on a short prefix, then naming the language.** `-ac 512` fixes
+    the encoder at 512 positions no matter how short the clip is, so detecting
+    on 1.5 s costs 1230 ms against 1322 ms for the whole utterance. Two passes
+    would be 2013 ms — worse than simply asking for `auto` once.
+  * **Priming the decoder with the command vocabulary.** 781 characters of
+    known phrases took 16.9 s and routed one *fewer*.
+
+`verbose_json` is a separate ~390 ms on top, for DTW word alignment. It is off
+unless someone asks for confidence.
 """
 
 from __future__ import annotations
@@ -97,85 +127,64 @@ _LANG_NAMES = {"english": "en", "chinese": "zh"}
 
 
 class SpeechToText:
-    """Transcription, with the conversation's language held steady.
+    """Transcription, detecting the spoken language on every utterance.
 
-    The first utterance is detected automatically; everything after it is
-    transcribed in that same language until the conversation goes idle. Two
-    reasons, and the second is the one that matters:
+    Nothing is remembered between turns. A command in English followed by one
+    in Mandarin followed by one in English is three independent detections,
+    which is what lets the user switch without saying so. The module docstring
+    has what that costs and the three cheaper schemes that were measured and
+    rejected.
 
-    **It is what a conversation is.** People do not change language between
-    one sentence and the next, and an assistant that re-decides every time
-    will eventually decide wrong mid-exchange.
-
-    **Automatic detection ranges over all 99 languages Whisper knows.** On
-    this device it picked Korean and Japanese for Mandarin speech often
-    enough to matter — 총치, よいしょ, じゃあ — none of which can route, and
-    none of which the assistant supports. Naming the language removes the
-    choice, and is also ~390 ms faster per utterance than `auto`.
+    The exception is a caller that genuinely knows the language, which is
+    `listen(..., language=...)` — see there.
     """
 
     def __init__(self, cfg: SttConfig, rate: int = 16000):
         self.cfg = cfg
         self.rate = rate
         self._session = requests.Session()
-        # The conversation's language, once known.
-        self.locked: str | None = None
-        self._last_used = 0.0
 
-    def _current_language(self) -> str:
-        """The language to ask for, expiring the lock if idle."""
-        if self.locked is None:
-            return "auto" if self.cfg.auto_detect else self.cfg.default_language
-        if (self.cfg.lock_timeout_s
-                and time.monotonic() - self._last_used > self.cfg.lock_timeout_s):
-            log.info("language lock on %r expired after %.0fs idle",
-                     self.locked, time.monotonic() - self._last_used)
-            self.locked = None
-            return "auto" if self.cfg.auto_detect else self.cfg.default_language
-        return self.locked
-
-    def reset_language(self) -> None:
-        """Forget the conversation's language, so the next turn re-detects."""
-        if self.locked is not None:
-            log.info("language lock on %r cleared", self.locked)
-        self.locked = None
+    def _detect_with(self) -> str:
+        """What to ask for when the caller has not named a language."""
+        return "auto" if self.cfg.auto_detect else self.cfg.default_language
 
     def listen(self, audio: np.ndarray, language: str | None = None) -> Transcript:
-        """Transcribe an utterance in the conversation's language.
+        """Transcribe an utterance, detecting its language unless told.
 
-        `language` names it outright for this one utterance, for the case where
-        the caller genuinely knows better than the lock does. Answering a
-        question is that case: the assistant has just asked something out loud
-        in a particular language and is holding the floor for the reply, so the
-        reply is in that language and there is nothing to detect.
+        `language` names it outright, for a caller that knows better than any
+        detector could. Answering a question is that case: the assistant has
+        just asked something out loud in a particular language and is holding
+        the floor for the reply, so the reply is in that language and there is
+        nothing to detect.
 
-        It matters because the alternative failed in the field. A one-word
-        confirmation is very little audio to identify a language from, and with
-        the lock idle, automatic detection rendered a spoken 确定 as 'Trading'
-        and as 'seting.' — English, twice, for the answer to a Chinese
-        question. Neither is a yes, so the shutdown was silently cancelled.
-        Naming the language is also ~390 ms cheaper, per the measurements above.
+        That path is not an optimisation, it is a correctness fix, and it must
+        stay. A one-word confirmation is very little audio to identify a
+        language from, and automatic detection rendered a spoken 确定 as
+        'Trading' and as 'seting.' — English, twice, answering a Chinese
+        question. Neither is a yes, so a shutdown the user had authorised was
+        silently cancelled. Naming it is also ~600 ms cheaper.
         """
         wav = _wav_bytes(audio, self.rate)
-        result = self._transcribe(wav, language or self._current_language())
+        result = self._transcribe(wav, language or self._detect_with())
 
-        # Decoded in a language this assistant does not support. Redo it in a
-        # supported one rather than handing the router text it can never
+        # Decoded into a language this assistant does not support. Redo it in
+        # a supported one rather than handing the router text it can never
         # match — the CJK neighbours are what Whisper reaches for on Mandarin,
-        # so Chinese is the right second guess when nothing else is known.
+        # so Chinese is the right second guess. This fired on audio captured
+        # through the broken decimator and has not fired since; it is kept as
+        # a net, not as a working part of the path.
         if detect_script(result.text) == "other":
-            retry_in = self.locked or "zh"
-            log.info("transcript %r is not a supported language; retrying as %r",
-                     result.text[:20], retry_in)
-            result = self._transcribe(wav, retry_in)
+            log.info("transcript %r is not a supported language; retrying as zh",
+                     result.text[:20])
+            result = self._transcribe(wav, "zh")
 
+        # The script of what came back is a better answer than what was asked
+        # for: `auto` reports nothing in the fast `json` mode, and a
+        # code-switched "帮我 search the weather" should be replied to in
+        # whichever language carries the sentence. See `detect_script`.
         script = detect_script(result.text)
         if script in self.cfg.supported_languages:
             result.language = script
-            if self.locked is None:
-                self.locked = script
-                log.info("conversation language locked to %r", script)
-        self._last_used = time.monotonic()
         return result
 
     def _transcribe(self, wav: bytes, language: str) -> Transcript:
