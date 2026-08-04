@@ -46,6 +46,16 @@ class CommandSpec:
     # requires it and the router refuses to fast-path them.
     confirm: bool = False
 
+    # A score this command needs before it may fire, overriding the router's
+    # own floor upwards. For a command with a near-twin — 搜索歌词 against
+    # 搜索歌曲, one syllable apart and 0.80 alike in pinyin — the default
+    # floor is what lets one answer for the other, and no threshold that
+    # both can share fixes it. Raising it here refuses the near-miss and
+    # lets the slow path ask, rather than guessing between two commands
+    # that do unrelated things. Only ever raises: a spec cannot make itself
+    # easier to trigger than the router allows.
+    min_score: float | None = None
+
     # This command is *meant* to leave audio stopped. Music is paused while
     # the assistant listens (see audio/ducking.py) and normally resumed
     # afterwards — but resuming after "pause" would undo the very thing that

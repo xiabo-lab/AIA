@@ -31,14 +31,20 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from math import ceil
 
 from aia.plugins.base import CommandSpec, Plugin, Registry
 
 log = logging.getLogger(__name__)
 
 SLOT = re.compile(r"\{(\w+)\}")
+
+# How alike an utterance and a trigger must be before the utterance counts as
+# that trigger with its argument left off. See `_is_bare_trigger`.
+BARE_TRIGGER = 0.95
 
 # Punctuation Whisper likes to add, which no spoken phrase contains.
 _STRIP = re.compile(r"[\s,.!?;:'\"，。！？、；：…—\-]+")
@@ -107,6 +113,9 @@ class FastRouter:
         # Commands with an argument match only their trigger, which is short —
         # 播放 is two syllables — so the bar is higher to compensate.
         self.argument_threshold = argument_threshold
+        self._whole_cache: list[str] | None = None
+        self._whole_lengths: list[int] = []
+        self._trigger_cache: list[str] | None = None
 
     def match(self, text: str, language: str = "en") -> Intent | None:
         target = normalise(text)
@@ -130,18 +139,45 @@ class FastRouter:
                 len(SLOT.sub("", intent.matched)),
             )
 
-        best: Intent | None = None
+        candidates: list[Intent] = []
         for plugin, command in self.registry.all_commands():
             for lang, phrases in command.phrases.items():
                 for phrase in phrases:
                     found = self._match_phrase(plugin, command, phrase, text, target)
-                    if found and (best is None or rank(found) > rank(best)):
-                        best = found
+                    if found:
+                        candidates.append(found)
+
+        # Rank first, then ask whether the argument is really an argument,
+        # rather than asking it of every candidate as it is built. Only the
+        # winner's answer is ever used, and asking in rank order brings the
+        # question from 19 times an utterance down to 0.8. Losing candidates
+        # are reached only when the winner turns out to have eaten a
+        # command — which is precisely when the runner-up is what was meant.
+        best: Intent | None = None
+        for intent in sorted(candidates, key=rank, reverse=True):
+            if intent.arguments and self._is_command(next(iter(intent.arguments.values()))):
+                log.debug("%s took a command as its argument; passing over it", intent)
+                continue
+            best = intent
+            break
 
         if best is None:
             return None
 
+        # A bare trigger is a command with its argument missing, not a
+        # command whose argument is the rest of itself. "搜索歌曲" is the
+        # whole of `search_song`'s trigger and nothing else, and the only
+        # match it can produce is the shorter 搜索 eating 歌曲 and calling
+        # it a song name — so the app is sent looking for a song called
+        # "song". Declining hands it to the slow path, which can ask which
+        # song, and that is the answer the speaker was about to give.
+        if best.command.takes_argument and self._is_bare_trigger(target):
+            log.debug("%r is a trigger with no argument; declining", text)
+            return None
+
         floor = self.argument_threshold if best.command.takes_argument else self.threshold
+        if best.command.min_score is not None:
+            floor = max(floor, best.command.min_score)
         if best.score < floor:
             log.debug("best fast-path candidate %s scored %.2f, below %.2f",
                       best, best.score, floor)
@@ -175,6 +211,123 @@ class FastRouter:
             plugin, command, {slot.group(1): tail.strip()},
             similarity(normalise(head), normalise(trigger)), phrase,
         )
+
+    def _whole_phrases(self) -> list[str]:
+        """Every phrase that is a complete command on its own, normalised.
+
+        Built once and kept sorted by length, which is what lets
+        `_resembles` skip most of them without looking at them. The registry
+        is fixed for the life of the process — it is built from the plugin
+        list at startup — so rebuilding this would re-run pinyin over all
+        ~145 phrases to reach an answer that cannot have changed.
+        """
+        if self._whole_cache is None:
+            self._whole_cache = sorted(
+                (normalise(phrase)
+                 for _, command in self.registry.all_commands()
+                 if not command.takes_argument
+                 for phrases in command.phrases.values()
+                 for phrase in phrases),
+                key=len,
+            )
+            self._whole_lengths = [len(p) for p in self._whole_cache]
+        return self._whole_cache
+
+    def _triggers(self) -> list[str]:
+        """The lead-in of every phrase that takes an argument, normalised."""
+        if self._trigger_cache is None:
+            self._trigger_cache = []
+            for _, command in self.registry.all_commands():
+                for phrases in command.phrases.values():
+                    for phrase in phrases:
+                        slot = SLOT.search(phrase)
+                        if slot is None:
+                            continue
+                        folded = normalise(phrase[: slot.start()])
+                        if folded:
+                            self._trigger_cache.append(folded)
+        return self._trigger_cache
+
+    def _is_bare_trigger(self, target: str) -> bool:
+        """Is the whole utterance just some command's trigger and nothing more?
+
+        Near-identity, not the ordinary argument threshold. A short argument
+        moves the ratio very little — 查找歌曲夜曲 against the trigger 查找歌曲
+        is 0.85, comfortably over the 0.82 an argument match needs — so
+        anything looser than this throws away real commands to catch the
+        empty ones. At 0.95 the utterance has to be the trigger with at most
+        a syllable's worth of difference, which is what "no argument" means.
+        """
+        return any(similarity(target, trigger) >= BARE_TRIGGER
+                   for trigger in self._triggers())
+
+    def _is_command(self, tail: str) -> bool:
+        """Is this "argument" just the name of another command?
+
+        A slot runs to the end of the utterance, so a short trigger will
+        happily eat the rest of a longer command and call it a query: 搜索
+        matches the front of 搜索歌词 and hands back 歌词, which is how
+        "search lyric" ends up opening the Song Search window and searching
+        for the word "lyrics" — the one confusion these commands must never
+        have. A query is a thing out in the world; 歌词 is a button on this
+        screen. When the tail is itself a command, the split was wrong, and
+        declining lets the whole-utterance match win instead.
+
+        Only whole-utterance commands count. Comparing against triggers too
+        would reject "play the song called stop it" for containing a verb.
+        """
+        folded = normalise(tail)
+        return bool(folded) and self._resembles(folded)
+
+    def _resembles(self, folded: str) -> bool:
+        """Does `folded` reach the threshold against any whole phrase?
+
+        The same answer as a plain `similarity()` loop over every phrase,
+        reached without doing most of the work: there are ~145 phrases to
+        try and `ratio()` is quadratic in the length of what it compares.
+
+        Two cuts. First, length: `ratio()` is `2 * matches / (len(a) +
+        len(b))` and `matches` cannot exceed the shorter string, so only
+        phrases within a band around `len(folded)` can reach the threshold
+        at all — at 0.78 that band is 0.64x to 1.56x, which is 69 of the 145
+        phrases for a typical tail, and they are kept sorted by length so it
+        is two bisections rather than a scan. Second, within the band,
+        difflib's own linear upper bounds reject a phrase by counting
+        characters before anything aligns them, and the matcher is built
+        once with the tail as `b` so difflib's b-side index is built once
+        rather than per phrase.
+
+        Worth being honest about the size of this. Per utterance over the
+        routing corpus, each configuration in its own interpreter and
+        repeated: 5.5-6.0 ms with no guard at all, 5.8-6.2 ms as it stands,
+        7.0-7.4 ms with a plain `ratio()` against every phrase. Identical
+        verdicts in all three. So the guards themselves are not measurably
+        more expensive than not having them — those two ranges overlap and
+        nothing should be claimed from the difference — while the plain
+        loop is consistently about a millisecond worse. On a 2.5 s budget
+        none of it matters; this is written this way because it is no harder
+        to read, not because the router was short of time.
+
+        Measure in separate processes if you revisit this. Timing several
+        configurations in one interpreter reported 5.7 ms for whichever ran
+        first and ~38 ms for every one after it, which reads exactly like a
+        catastrophic regression in whatever you happened to measure second.
+        """
+        phrases = self._whole_phrases()
+        length = len(folded)
+        lo = bisect_left(self._whole_lengths, ceil(self.threshold * length / (2 - self.threshold)))
+        hi = bisect_right(self._whole_lengths, int((2 - self.threshold) * length / self.threshold))
+        if lo >= hi:
+            return False
+
+        matcher = SequenceMatcher(None, "", folded)
+        for phrase in phrases[lo:hi]:
+            matcher.set_seq1(phrase)
+            if (matcher.real_quick_ratio() >= self.threshold
+                    and matcher.quick_ratio() >= self.threshold
+                    and matcher.ratio() >= self.threshold):
+                return True
+        return False
 
     @staticmethod
     def _split_argument(raw: str, trigger: str) -> tuple[str, str] | None:

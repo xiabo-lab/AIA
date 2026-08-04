@@ -34,9 +34,14 @@ OUT = Path(__file__).resolve().parents[1] / "commands.html"
 # table was not updated.
 SECTIONS = [
     ("Playback", ["resume", "pause", "next", "previous", "stop", "toggle"]),
-    ("Ask for something", ["play", "search", "volume"]),
+    ("Ask for something", ["play", "search", "search_song", "volume"]),
     ("Modes and information", ["now_playing", "shuffle", "repeat", "like",
                                "lyrics", "karaoke"]),
+    # Their own section, and printed adjacent, because the card is also where
+    # someone works out which of the two lyric commands they want. "搜索歌词"
+    # and "搜索歌曲" differ by one syllable and do unrelated things; seeing
+    # them apart on the page is worth more than tidy grouping.
+    ("Lyrics on the karaoke screen", ["search_lyrics", "save_lyrics"]),
     ("Device — these ask before acting", ["quit", "shutdown", "reboot"]),
 ]
 

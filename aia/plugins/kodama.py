@@ -262,6 +262,41 @@ class KodamaLite(Plugin):
             return self._needs_control() if self.available() else self._unavailable()
         return Result.done("Showing lyrics.", "正在显示歌词。")
 
+    def search_lyrics(self) -> Result:
+        """The karaoke stage's magnifier: look the lyric up again.
+
+        Deliberately not `lyrics`. That one shows what has already been
+        found; this one goes back out to the sources for the track playing
+        now. They are two buttons on the same screen and they have to stay
+        two commands — see the note on the CommandSpec pair below.
+        """
+        if not self._control("lyrics_search"):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Searching for lyrics.", "正在搜索歌词。")
+
+    def save_lyrics(self) -> Result:
+        """The green tick: commit the lyric on screen to the cache.
+
+        Nothing reaches Kodama-Lite's persistent lyrics cache until this is
+        pressed, so this is the one lyrics command that writes anything.
+        """
+        if not self._control("lyrics_save"):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done("Lyrics saved.", "歌词已保存。")
+
+    def search_song(self, query: str) -> Result:
+        """Song Search, with a name — the same endpoint `search` uses.
+
+        A separate command rather than more phrases on `search` because the
+        trigger has to be long enough to be told apart from 搜索歌词 by
+        something more than one syllable. `search` stays as the general
+        "搜索X" form; this one exists so that saying the word 歌曲 out loud
+        cannot land in the lyrics half of the app.
+        """
+        if not self._control("search", query):
+            return self._needs_control() if self.available() else self._unavailable()
+        return Result.done(f"Searching for {query}.", f"正在搜索{query}。")
+
     def karaoke(self, state: str = "") -> Result:
         if not self._control("karaoke", state or None):
             return self._needs_control() if self.available() else self._unavailable()
@@ -387,13 +422,68 @@ class KodamaLite(Plugin):
                     "zh": ("点赞", "喜欢这首歌", "收藏这首歌", "加入收藏"),
                 },
             ),
+            # ── the three lyrics/song commands that must not overlap ──
+            # These are one screen's worth of buttons and three different
+            # actions, and two of them are one syllable apart in Mandarin:
+            # 搜索歌词 is `sousuogeci` and 搜索歌曲 is `sousuogequ`, which
+            # score 0.80 against each other in the pinyin the router
+            # compares — above the 0.78 it needs to fire. So the separation
+            # is not left to the threshold:
+            #
+            #   * `lyrics` no longer answers to "搜索歌词" at all. It used
+            #     to carry both, which meant the show and search phrases
+            #     could never be told apart because they were one command.
+            #   * `search_lyrics` and `save_lyrics` take no argument, so
+            #     they are matched end to end and carry a raised `min_score`
+            #     — a misheard 曲 lands 0.80 and is refused rather than
+            #     opening the Song Search window.
+            #   * `search_song` requires a name after the trigger, and its
+            #     four-syllable trigger beats the two-syllable 搜索 on the
+            #     router's longest-trigger tie-break, so the name arrives
+            #     clean instead of as "歌曲晴天".
             CommandSpec(
                 name="lyrics", description="Show lyrics for the current track",
                 handler=self.lyrics,
                 phrases={
                     "en": ("show lyrics", "lyrics", "show the lyrics",
-                           "search lyrics", "find the lyrics"),
-                    "zh": ("显示歌词", "歌词", "搜索歌词", "找歌词", "看歌词"),
+                           "display lyrics", "show me the lyrics"),
+                    "zh": ("显示歌词", "歌词", "看歌词", "显示一下歌词"),
+                },
+            ),
+            CommandSpec(
+                name="search_lyrics",
+                description="Search again for the current track's lyrics",
+                handler=self.search_lyrics, min_score=0.85,
+                phrases={
+                    "en": ("search lyric", "search lyrics", "search for lyrics",
+                           "search the lyrics", "find lyrics", "find the lyrics",
+                           "look up the lyrics", "search for the lyrics"),
+                    "zh": ("搜索歌词", "搜寻歌词", "查找歌词", "找歌词",
+                           "重新搜索歌词", "搜一下歌词"),
+                },
+            ),
+            CommandSpec(
+                name="save_lyrics",
+                description="Save the current lyrics to the lyrics cache",
+                handler=self.save_lyrics, min_score=0.85,
+                phrases={
+                    "en": ("save lyric", "save lyrics", "save the lyrics",
+                           "save these lyrics", "keep these lyrics",
+                           "confirm lyrics", "confirm the lyrics"),
+                    "zh": ("保存歌词", "保存这个歌词", "保存这首歌的歌词",
+                           "储存歌词", "确认歌词"),
+                },
+            ),
+            CommandSpec(
+                name="search_song", description="Search for a song by name",
+                handler=self.search_song, params={"query": "song name"},
+                phrases={
+                    "en": ("search song {query}", "search songs {query}",
+                           "search for song {query}", "search for the song {query}",
+                           "find song {query}", "find the song {query}"),
+                    "zh": ("搜索歌曲{query}", "搜寻歌曲{query}",
+                           "查找歌曲{query}", "找歌曲{query}",
+                           "搜索一下歌曲{query}"),
                 },
             ),
             CommandSpec(
