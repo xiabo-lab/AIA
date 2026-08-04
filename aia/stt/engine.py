@@ -176,14 +176,22 @@ class SpeechToText:
 
         # Decoded into a language this assistant does not support. Redo it in
         # a supported one rather than handing the router text it can never
-        # match — the CJK neighbours are what Whisper reaches for on Mandarin,
-        # so Chinese is the right second guess. This fired on audio captured
-        # through the broken decimator and has not fired since; it is kept as
-        # a net, not as a working part of the path.
+        # match. This fired on audio captured through the broken decimator and
+        # has not fired since; it is kept as a net, not as a working part of
+        # the path.
+        #
+        # Retry in the language the CALLER named, if it named one. It used to
+        # retry as "zh" unconditionally, which threw away the one thing more
+        # reliable than any detector — and the only caller that names a
+        # language is the confirmation, deciding whether an irreversible action
+        # goes ahead. An English "yes" would have been re-decoded as Mandarin.
+        # With nothing named, Chinese is still the right second guess: the CJK
+        # neighbours are what Whisper reaches for on Mandarin.
         if detect_script(result.text) == "other":
-            log.info("transcript %r is not a supported language; retrying as zh",
-                     result.text[:20])
-            result = self._transcribe(wav, "zh")
+            retry_in = language or "zh"
+            log.info("transcript %r is not a supported language; retrying as %r",
+                     result.text[:20], retry_in)
+            result = self._transcribe(wav, retry_in)
 
         # The script of what came back is a better answer than what was asked
         # for: `auto` reports nothing in the fast `json` mode, and a
