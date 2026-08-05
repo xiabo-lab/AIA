@@ -95,4 +95,16 @@ jobs:
             exit 1
           fi
 
-          gh release create "$tag" --title "$tag" --notes "$notes"
+          # Create if absent, update if present. A release can already exist
+          # because somebody published it from the web form before this
+          # workflow did, or because an earlier run failed after creating it —
+          # and `gh release create` answers both with "Release.tag_name
+          # already exists", which fails the job and leaves whatever is there
+          # untouched. That is how v0.3.0 ended up published with an empty
+          # body. Being idempotent means a re-run is always the repair.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists — updating its notes from the tag"
+            gh release edit "$tag" --title "$tag" --notes "$notes"
+          else
+            gh release create "$tag" --title "$tag" --notes "$notes"
+          fi
