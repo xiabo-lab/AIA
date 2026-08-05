@@ -11,6 +11,7 @@ deliberate trade rather than a tuning afterthought.
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import webrtcvad
@@ -18,6 +19,13 @@ import webrtcvad
 from aia.core.config import AudioConfig, VadConfig
 
 log = logging.getLogger(__name__)
+
+# Peak level above which a capture counts as too hot to endpoint: -6 dBFS of
+# a 16-bit sample. Not a guess — it is where the two populations actually
+# separate. Every capture that ran to the cap peaked between -3.6 and
+# 0.0 dBFS; every one that endpointed normally peaked between -10.8 and
+# -24.3. See `Endpointer._report_cap`.
+_HOT_PEAK = 16422
 
 
 class Endpointer:
@@ -56,6 +64,44 @@ class Endpointer:
         if len(frame) != self.audio.frame_samples:
             return False
         return self.vad.is_speech(frame.tobytes(), self.audio.target_rate)
+
+    def _report_cap(self, peak: int, speech_ms: int, captured_ms: int) -> None:
+        """Say why an utterance could only end by running out of room.
+
+        Hitting `max_utterance_ms` always means the endpointer never saw
+        `silence_ms` of quiet, so the two numbers worth having are how much of
+        the capture read as speech and how loud it was. This exists because
+        working that out the first time took amplifying WAVs offline, and the
+        answer should be one line in the journal instead.
+
+        A microphone near full scale makes webrtcvad call *every* frame
+        speech. Measured: a capture that is 33% voiced at its own level is
+        100% voiced once amplified to peak 0.0 dBFS, on every file tried. The
+        bar is proximity to the rail rather than clipping — at +24 dB only
+        0.8% of samples actually clipped and the verdict was already 100%
+        voiced, and two real capped captures had *no* clipped samples at all.
+
+        Logged, not acted on. Refusing to trust the detector on loud frames is
+        a tuning change that needs measuring against real speech first: a
+        shout is loud and is also a real command.
+        """
+        peak_dbfs = -99.0 if peak <= 0 else 20 * math.log10(peak / 32768)
+        voiced_pct = 100.0 * speech_ms / max(captured_ms, 1)
+        if peak >= _HOT_PEAK:
+            log.warning(
+                "that capture peaked at %.1f dBFS and read %.0f%% speech — too "
+                "hot to endpoint. Near full scale every frame looks like "
+                "speech, so the utterance can only end at the cap. Lower the "
+                "capture gain (amixer -c <n> sset Mic <lower>) and turn Auto "
+                "Gain Control off.",
+                peak_dbfs, voiced_pct,
+            )
+        else:
+            log.warning(
+                "capture ran to the cap at %.1f dBFS peak, %.0f%% speech — the "
+                "endpointer never saw %d ms of quiet.",
+                peak_dbfs, voiced_pct, self.cfg.silence_ms,
+            )
 
     def collect(self, frames, on_frame=None) -> np.ndarray | None:
         """Consume frames until the utterance ends. Returns 16 kHz int16 audio.
@@ -105,6 +151,7 @@ class Endpointer:
         run_ms = 0
         longest_run_ms = 0
         started = False
+        peak_sample = 0
 
         self._fresh_vad()
         preroll_frames = max(1, self.cfg.preroll_ms // self._frame_ms)
@@ -113,6 +160,10 @@ class Endpointer:
             speech = self._is_speech(frame)
             if on_frame is not None:
                 on_frame(frame, speech, started)
+
+            # Track how close the input ran to the rail. See `_report_cap`.
+            if len(frame):
+                peak_sample = max(peak_sample, int(np.max(np.abs(frame))))
 
             if not started:
                 waited_ms += self._frame_ms
@@ -154,6 +205,8 @@ class Endpointer:
                 break
             if len(collected) * self._frame_ms >= self.cfg.max_utterance_ms:
                 log.warning("utterance hit the %d ms cap", self.cfg.max_utterance_ms)
+                self._report_cap(peak_sample, speech_ms,
+                                 len(collected) * self._frame_ms)
                 break
             # Started on something that turned out not to be speech: give up
             # waiting rather than sitting here until the hard cap.

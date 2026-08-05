@@ -75,10 +75,29 @@ def find_input_device(match: str) -> int:
     moves when other USB audio is present — the mic came up as hw:2,0 here,
     but that is not stable across reboots or re-plugging.
     """
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_input_channels"] > 0 and match in dev["name"]:
-            log.info("microphone: [%d] %s", idx, dev["name"].strip())
-            return idx
+    matches = [(idx, dev) for idx, dev in enumerate(sd.query_devices())
+               if dev["max_input_channels"] > 0 and match in dev["name"]]
+
+    if matches:
+        idx, dev = matches[0]
+        # Say so when there was a choice. Two USB microphones enumerate with
+        # the *same* name here — "USB PnP Sound Device: Audio (hw:2,0)" and
+        # "(hw:3,0)" — differing only by a card number that moves on reboot
+        # and re-plug. Taking the first is as good a rule as any, but doing it
+        # silently is what turned swapping a microphone into a long hunt: the
+        # capture came from a different capsule with ~10 dB more gain, every
+        # log line looked normal, and the only symptom was every utterance
+        # running to the endpointer's cap.
+        if len(matches) > 1:
+            log.warning(
+                "%d input devices match %r; using [%d] %s. The others are %s — "
+                "if that is the wrong one, unplug it or make device_match "
+                "more specific.",
+                len(matches), match, idx, dev["name"].strip(),
+                [d["name"].strip() for _, d in matches[1:]],
+            )
+        log.info("microphone: [%d] %s", idx, dev["name"].strip())
+        return idx
 
     # Not found is two different faults wearing the same face, and by far the
     # likelier one is that the device is fine and somebody else has it: ALSA
