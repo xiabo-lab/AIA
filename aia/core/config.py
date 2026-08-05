@@ -256,6 +256,25 @@ class SttConfig:
 
 
 @dataclass(frozen=True)
+class KodamaConfig:
+    """Talking to the music player."""
+
+    # The MPRIS bus name to drive. Worth being settable rather than a
+    # constant: this app publishes *two* players — its own service and a
+    # WebKit media session for the same audio, from the webview — so which one
+    # is meant is a real distinction, and the webview's name carries a
+    # per-launch instance suffix.
+    player: str = "kodamalite"
+
+    # Bounds on a hang, not targets. Both were 3 s and hardcoded, which is
+    # over the whole turn's 2.5 s budget on its own. Measured, a `playerctl`
+    # call costs 6-7 ms and the control POST is to localhost, so this is two
+    # orders of magnitude of slack and still cannot blow the budget by itself.
+    playerctl_timeout_s: float = 1.5
+    control_timeout_s: float = 1.5
+
+
+@dataclass(frozen=True)
 class TtsConfig:
     binary: Path = VENDOR / "piper" / "piper"
     voices: dict[str, Path] = field(default_factory=lambda: {
@@ -279,6 +298,7 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     stt: SttConfig = field(default_factory=SttConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
+    kodama: KodamaConfig = field(default_factory=KodamaConfig)
 
     # Fast-path target from the spec. Exceeding it is not fatal, but the
     # state machine logs a warning so regressions surface in the journal

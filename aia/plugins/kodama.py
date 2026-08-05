@@ -31,11 +31,11 @@ from pathlib import Path
 
 import requests
 
+from aia.core.config import CONFIG, KodamaConfig
 from aia.plugins.base import CommandSpec, Plugin, Result
 
 log = logging.getLogger(__name__)
 
-PLAYER = "kodamalite"
 
 # Where Kodama-Lite publishes its control endpoint. Its stream server binds a
 # random port under a random per-launch token — deliberately, so knowing the
@@ -63,7 +63,10 @@ def parse_level(text: str) -> int | None:
     # before any digit or numeral hunting, or the 百 in it reads as a value.
     text = text.replace("百分之", "").replace("百分比", "")
 
-    digits = re.search(r"\d+", text)
+    # The sign is part of the number. Without it "-10" reads as 10 and
+    # turns the volume *up*, which is the opposite of what was asked;
+    # clamping a negative to 0 at least does something defensible.
+    digits = re.search(r"-?\d+", text)
     if digits:
         return max(0, min(100, int(digits.group())))
 
@@ -109,11 +112,16 @@ class KodamaLite(Plugin):
     name = "kodama"
     description = "Music player (Kodama-Lite)"
 
-    def _run(self, *args: str, timeout: float = 3.0) -> tuple[bool, str]:
+    def __init__(self, cfg: KodamaConfig | None = None):
+        self.cfg = cfg or CONFIG.kodama
+
+    def _run(self, *args: str, timeout: float | None = None) -> tuple[bool, str]:
         try:
             proc = subprocess.run(
-                ["playerctl", "-p", PLAYER, *args],
-                capture_output=True, text=True, timeout=timeout, env=_session_bus_env(),
+                ["playerctl", "-p", self.cfg.player, *args],
+                capture_output=True, text=True,
+                timeout=timeout if timeout is not None else self.cfg.playerctl_timeout_s,
+                env=_session_bus_env(),
             )
         except FileNotFoundError:
             log.error("playerctl is not installed")
@@ -124,7 +132,7 @@ class KodamaLite(Plugin):
         return proc.returncode == 0, proc.stdout.strip()
 
     def available(self) -> bool:
-        ok, _ = self._run("status", timeout=2.0)
+        ok, _ = self._run("status")
         return ok
 
     # ── the control endpoint, for everything MPRIS cannot reach ──────
@@ -147,25 +155,50 @@ class KodamaLite(Plugin):
             return None
         return data.get("url")
 
-    def _control(self, action: str, argument: str | None = None) -> bool:
+    def _control(self, action: str, argument: str | None = None) -> str | None:
+        """Send a command. Returns None on success, else why it failed.
+
+        Tri-state rather than a bool because the three failures want three
+        different things said, and telling them apart used to cost a second
+        `playerctl` spawn: every caller answered a False by asking
+        `available()` all over again to guess which had happened.
+
+        Note the app answers 202 the moment the event is on its bus, before
+        the view plane has acted — deliberately, so the assistant is not
+        waiting on the UI to speak. What it must not do is answer 202 to an
+        action it has never heard of, because then this cannot tell a real
+        command from a feature the installed version predates. Kodama-Lite
+        rejects unknown actions with 400 from v0.1.39; against anything older
+        every command here reports success it did not have.
+        """
         url = self._control_url()
         if not url:
-            return False
+            return "no-endpoint"
         payload = {"action": action}
         if argument is not None:
             payload["argument"] = argument
         try:
-            resp = requests.post(url, json=payload, timeout=3)
+            resp = requests.post(url, json=payload,
+                                 timeout=self.cfg.control_timeout_s)
         except requests.RequestException as exc:
             log.warning("control %s failed: %s", action, exc)
-            return False
+            return "unreachable"
+        if resp.status_code == 400:
+            log.warning("control %s was rejected — the app does not know that "
+                        "action", action)
+            return "no-endpoint"
         if resp.status_code >= 400:
             log.warning("control %s returned %s", action, resp.status_code)
-            return False
-        return True
+            return "unreachable"
+        return None
 
-    def _needs_control(self) -> Result:
-        """The endpoint is missing — almost always an out-of-date app."""
+    def _control_failed(self, reason: str) -> Result:
+        """What to say about a control command that did not land."""
+        if reason == "unreachable":
+            return self._unavailable()
+        # Either no endpoint file at all, or the app rejected the action.
+        # Both mean the same thing to the person listening: this build cannot
+        # do that.
         return Result.failed(
             "That needs a newer version of Kodama-Lite.",
             "这个功能需要更新版本的 Kodama-Lite。",
@@ -191,13 +224,27 @@ class KodamaLite(Plugin):
         return Result.done("Playing.", "开始播放。") if ok else self._unavailable()
 
     def toggle(self) -> Result:
-        ok, _ = self._run("play-pause")
+        """Flip playback, and say which way it went.
+
+        Reads the state, then asks for the opposite outright rather than
+        sending `play-pause` and looking up what happened. Looking it up does
+        not work: MPRIS status lags a transition by 88-156 ms on this device,
+        so the read came back with the state from *before* the toggle and the
+        assistant announced the opposite of what it had just done — measured
+        wrong 4 times out of 4, in both directions.
+
+        Naming the target state also makes the reply true by construction:
+        what is announced is what was asked for, not what a second query
+        guessed a moment too early.
+        """
+        ok, status = self._run("status")
         if not ok:
             return self._unavailable()
-        _, status = self._run("status")
         playing = status.lower() == "playing"
-        return Result.done("Playing." if playing else "Paused.",
-                           "开始播放。" if playing else "已暂停。")
+        if not self._run("pause" if playing else "play")[0]:
+            return self._unavailable()
+        return Result.done("Paused." if playing else "Playing.",
+                           "已暂停。" if playing else "开始播放。")
 
     def next_track(self) -> Result:
         if not self._run("next")[0]:
@@ -225,41 +272,48 @@ class KodamaLite(Plugin):
         return Result.done(f"{title}.", f"{title}。")
 
     def play(self, query: str) -> Result:
-        if not self._control("play", query):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("play", query)
+        if failed:
+            return self._control_failed(failed)
         return Result.done(f"Playing {query}.", f"正在播放{query}。")
 
     def search(self, query: str) -> Result:
-        if not self._control("search", query):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("search", query)
+        if failed:
+            return self._control_failed(failed)
         return Result.done(f"Searching for {query}.", f"正在搜索{query}。")
 
     def volume(self, level: str) -> Result:
         value = parse_level(level)
         if value is None:
             return Result.failed("What volume?", "音量调到多少？")
-        if not self._control("volume", str(value)):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("volume", str(value))
+        if failed:
+            return self._control_failed(failed)
         return Result.done(f"Volume {value} percent.", f"音量百分之{value}。")
 
     def shuffle(self, state: str = "") -> Result:
-        if not self._control("shuffle", state or None):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("shuffle", state or None)
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Shuffle toggled.", "随机播放已切换。")
 
     def repeat(self, mode: str = "") -> Result:
-        if not self._control("repeat", mode or None):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("repeat", mode or None)
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Repeat toggled.", "循环模式已切换。")
 
     def like(self) -> Result:
-        if not self._control("like"):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("like")
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Liked.", "已点赞。")
 
     def lyrics(self) -> Result:
-        if not self._control("lyrics"):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("lyrics")
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Showing lyrics.", "正在显示歌词。")
 
     def search_lyrics(self) -> Result:
@@ -270,8 +324,9 @@ class KodamaLite(Plugin):
         now. They are two buttons on the same screen and they have to stay
         two commands — see the note on the CommandSpec pair below.
         """
-        if not self._control("lyrics_search"):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("lyrics_search")
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Searching for lyrics.", "正在搜索歌词。")
 
     def save_lyrics(self) -> Result:
@@ -280,8 +335,9 @@ class KodamaLite(Plugin):
         Nothing reaches Kodama-Lite's persistent lyrics cache until this is
         pressed, so this is the one lyrics command that writes anything.
         """
-        if not self._control("lyrics_save"):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("lyrics_save")
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Lyrics saved.", "歌词已保存。")
 
     def search_song(self, query: str) -> Result:
@@ -293,18 +349,21 @@ class KodamaLite(Plugin):
         "搜索X" form; this one exists so that saying the word 歌曲 out loud
         cannot land in the lyrics half of the app.
         """
-        if not self._control("search", query):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("search", query)
+        if failed:
+            return self._control_failed(failed)
         return Result.done(f"Searching for {query}.", f"正在搜索{query}。")
 
     def karaoke(self, state: str = "") -> Result:
-        if not self._control("karaoke", state or None):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("karaoke", state or None)
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Karaoke mode.", "卡拉OK模式。")
 
     def quit_app(self) -> Result:
-        if not self._control("quit"):
-            return self._needs_control() if self.available() else self._unavailable()
+        failed = self._control("quit")
+        if failed:
+            return self._control_failed(failed)
         return Result.done("Closing Kodama-Lite.", "正在关闭 Kodama-Lite。")
 
     def commands(self) -> list[CommandSpec]:
