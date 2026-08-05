@@ -1,0 +1,98 @@
+# Publish a GitHub Release whenever a `v*` tag is pushed:
+#
+#     git tag -a v0.3.1 -F - <<'EOF'
+#     <subject line>
+#
+#     <what changed and why>
+#     EOF
+#     git push origin main v0.3.1
+#
+# There is no build artifact. AIA is Python and runs from the tree — the Pi is
+# deployed with `git archive <tag> aia scripts | ssh …` (see the README), not
+# from a package. So a release here is a published, linkable record of what a
+# tag contains, which is the thing that was previously being written out by
+# hand every time.
+#
+# The release notes are the tag's own annotation. Tags in this repo already
+# carry the full explanation; copying it into a NOTES file or into this
+# workflow would leave two versions to keep in step, and the one nobody edits
+# is the one people read.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Also runnable by hand from the Actions tab, for a tag that was pushed
+  # before this workflow existed — or one whose run failed and was fixed
+  # without wanting to move the tag. Re-pushing a published tag to trigger a
+  # rebuild would rewrite something people may already have fetched.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish a release for, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # The annotation lives on the tag *object*, which a shallow clone
+          # does not fetch — without this `git tag -l --format=…` comes back
+          # empty and the release publishes with no notes at all.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: The command reference must match the code
+        # commands.txt and commands.html are generated from the plugin
+        # manifests, and the printed card is what somebody in the car reads to
+        # find out what they can say. Adding a command and forgetting to
+        # regenerate would tag a version whose documentation disagrees with
+        # what the assistant actually answers to. Cheap to check, and the only
+        # dependency the generators have is requests.
+        run: |
+          python -m pip install --quiet requests
+          python scripts/dump_commands.py
+          python scripts/print_card.py
+          if ! git diff --exit-code -- commands.txt commands.html; then
+            echo "::error::commands.txt / commands.html are out of date."
+            echo "Run scripts/dump_commands.py and scripts/print_card.py, then commit."
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$TAG"
+
+          # A lightweight tag has no annotation, and `%(contents)` silently
+          # falls back to the commit message — which would publish a release
+          # describing one commit as though it described the version. Refuse
+          # instead: this repo tags with `-a` and a written message.
+          if [ "$(git cat-file -t "$tag")" != "tag" ]; then
+            echo "::error::$tag is a lightweight tag. Release notes come from"
+            echo "the annotation, so tag with: git tag -a $tag -F -"
+            exit 1
+          fi
+
+          notes="$(git tag -l --format='%(contents)' "$tag")"
+          if [ -z "${notes//[$' \t\n']/}" ]; then
+            echo "::error::$tag is annotated but its message is empty."
+            exit 1
+          fi
+
+          gh release create "$tag" --title "$tag" --notes "$notes"
