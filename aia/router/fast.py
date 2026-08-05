@@ -126,6 +126,7 @@ class FastRouter:
         # Commands with an argument match only their trigger, which is short —
         # 播放 is two syllables — so the bar is higher to compensate.
         self.argument_threshold = argument_threshold
+        self._trigger_len: dict[str, int] = {}
         self._validate_phrases()
         self._whole_cache: list[str] | None = None
         self._whole_lengths: list[int] = []
@@ -160,7 +161,7 @@ class FastRouter:
             return (
                 intent.score,
                 0 if intent.command.takes_argument else 1,
-                len(normalise(SLOT.sub("", intent.matched))),
+                self._trigger_len[intent.matched],
             )
 
         candidates: list[Intent] = []
@@ -247,6 +248,12 @@ class FastRouter:
         for _, command in self.registry.all_commands():
             for phrases in command.phrases.values():
                 for phrase in phrases:
+                    # Normalised length of the fixed part, for the tie-break.
+                    # Computed here because phrases never change, and because
+                    # doing it inside `rank` cost 3.5 ms an utterance — it runs
+                    # once per candidate, and `normalise` runs pypinyin.
+                    self._trigger_len[phrase] = len(
+                        normalise(SLOT.sub("", phrase)))
                     slot = SLOT.search(phrase)
                     if slot and phrase[slot.end():].strip():
                         log.warning(
