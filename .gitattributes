@@ -4,6 +4,11 @@
 *.sh    text eol=lf
 *.py    text eol=lf
 *.service text eol=lf
+# Workflows are run by bash on a Linux runner, so the same rule applies: a
+# CRLF `run:` block hands the shell a \r at the end of every line, and the
+# errors that produces name the last word of the line rather than the ending.
+*.yml   text eol=lf
+*.yaml  text eol=lf
 
 # Model weights and audio are binary; never let git touch them.
 *.bin   binary
