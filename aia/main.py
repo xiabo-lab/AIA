@@ -142,13 +142,24 @@ def is_affirmative(text: str) -> bool | None:
     return None
 
 
-def save_utterance(audio, rate: int) -> None:
+def save_utterance(audio, rate: int, keep: int) -> None:
     """Write the captured utterance to .bench/utterances for offline replay.
 
     Every accuracy number so far came from synthesised speech, which is clean,
     close-miked and free of room reverb — it flatters every engine. Real
     captures are the only honest input for comparing recognisers, so keeping
-    them costs a few KB and saves having to reproduce a misrecognition live.
+    them saves having to reproduce a misrecognition live.
+
+    Bounded, because this runs on every turn for the life of the machine and
+    the destination is an SD card. Measured after four days: 101 files, 15 MB,
+    an average of **148 KB** each — the comment this replaces claimed "a few
+    KB", which was out by a factor of thirty, and nothing pruned them. Left
+    alone that is about 1.4 GB and 9,000 files a year, written to the same
+    flash that tts/piper.py deliberately routes around because a
+    write-per-utterance is "unkind to the card".
+
+    Oldest go first. A misrecognition is diagnosed within days or not at all,
+    and the newest are the ones anybody asks about.
     """
     directory = Path(__file__).resolve().parents[1] / ".bench" / "utterances"
     directory.mkdir(parents=True, exist_ok=True)
@@ -159,6 +170,14 @@ def save_utterance(audio, rate: int) -> None:
         w.setframerate(rate)
         w.writeframes(audio.tobytes())
     log.info("saved utterance to %s", path)
+
+    # Names are timestamps, so sorting by name is sorting by age.
+    existing = sorted(directory.glob("*.wav"))
+    for stale in existing[:max(0, len(existing) - keep)]:
+        try:
+            stale.unlink()
+        except OSError as exc:  # a file someone is reading, or a read-only card
+            log.debug("could not prune %s: %s", stale, exc)
 
 
 def main() -> int:
@@ -211,217 +230,225 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    with Microphone(cfg.audio) as mic:
-        frames = mic.frames()
-        log.info("AIA ready — say the wake word")
-        last_empty_turn = 0.0
+    # Cleanup belongs on every exit path, not just the tidy one. These
+    # three own real resources — the Vosk recogniser and both resident
+    # Piper processes — and an exception escaping the loop used to skip
+    # all of them. systemd papers over it by killing the whole cgroup;
+    # `python -m aia.main` by hand, which the README documents, does not.
+    try:
+        with Microphone(cfg.audio) as mic:
+            frames = mic.frames()
+            log.info("AIA ready — say the wake word")
+            last_empty_turn = 0.0
 
-        while not stopping:
-            frame = next(frames)
-            if not detector.detect(frame):
-                continue
-            if time.monotonic() - last_empty_turn < EMPTY_TURN_REFRACTORY_S:
-                # The last turn heard nothing, so this is almost certainly the
-                # same non-event firing again. See EMPTY_TURN_REFRACTORY_S.
-                continue
-
-            turn = machine.begin_turn()
-            machine.to(State.LISTENING)
-
-            # Silence the music FIRST — before the panel, before anything.
-            # The microphone and the speakers share a room, so a command given
-            # over music is captured as the command plus the song, and Whisper
-            # transcribes the mixture. This is the difference between the
-            # assistant working while music plays and not working at all.
-            # Only drop buffered audio if there actually was music in it.
-            # Those buffered frames are the pre-roll the endpointer uses, and
-            # music in them reads as speech to the VAD — it would start the
-            # utterance immediately, then endpoint on the silence that follows
-            # the pause. But draining unconditionally would clip the opening
-            # syllable of "小艾同学播放五月天" said in one breath, which works
-            # today, so it is done only when it buys something.
-            if ducker.duck():
-                mic.drain()
-
-            # Shown before anything is transcribed, because the question the
-            # user actually has at this moment is "did it hear me at all?".
-            panel.status(LISTENING_TEXT.get(stt_language, LISTENING_TEXT["en"]))
-
-            audio = endpointer.collect(frames)
-            turn.mark("captured")
-            if audio is not None and save_audio:
-                save_utterance(audio, cfg.audio.target_rate)
-            if audio is None:
-                # Nothing was said — a false wake, or the user changed their
-                # mind. Put the music straight back and take the "Listening…"
-                # line away rather than leaving it up implying otherwise.
-                ducker.restore()
-                panel.hide()
-                detector.reset()
-                machine.end_turn()
-                last_empty_turn = time.monotonic()
-                continue
-
-            machine.to(State.THINKING)
-            # Bound before the try because `finally` reads it, and `finally`
-            # runs on every exit path — including the early `continue` for a
-            # confirmation reply, and an exception raised before routing.
-            intent = None
-            try:
-                # Detected fresh every turn, so the user can switch language
-                # between one command and the next. See stt/engine.py.
-                result = stt.listen(audio)
-                turn.mark("stt")
-
-                # The blank-audio marker is cleared in stt/engine.py, which is
-                # the only place that knows it is a whisper.cpp artefact.
-                text = result.text.strip()
-
-                if not text:
-                    # Apologise in the language of the last turn that *worked*,
-                    # not in `result.language`. Nothing was understood, so this
-                    # transcript has no language to report — it falls back to
-                    # the configured default, which is English, and a Mandarin
-                    # speaker who was misheard would be told "I'm sorry, could
-                    # you repeat that?". The last language they were understood
-                    # in is the best guess available, and this only picks a
-                    # voice; it does not affect how anything is transcribed.
-                    machine.to(State.SPEAKING)
-                    apology = ("I'm sorry, could you repeat that?"
-                               if stt_language == "en" else "抱歉，请再说一遍。")
-                    panel.aia(apology)
-                    speaker.say(apology, stt_language)
-                    machine.end_turn()
-                    detector.reset()
-                    mic.drain()
+            while not stopping:
+                frame = next(frames)
+                if not detector.detect(frame):
+                    continue
+                if time.monotonic() - last_empty_turn < EMPTY_TURN_REFRACTORY_S:
+                    # The last turn heard nothing, so this is almost certainly the
+                    # same non-event firing again. See EMPTY_TURN_REFRACTORY_S.
                     continue
 
-                lang = reply_language(text, fallback=result.language)
-                stt_language = result.language
-                # What it heard, before it acts on it — so a misrecognition is
-                # visible rather than something to infer from a wrong action.
-                panel.user(text)
+                turn = machine.begin_turn()
+                machine.to(State.LISTENING)
 
-                intent = router.match(text, lang)
-                turn.mark("routed")
-
-                if intent is not None and intent.command.confirm:
-                    # Destructive: ask, then KEEP THE FLOOR and listen for the
-                    # answer in this same turn. Asking and then returning to
-                    # idle made the reply a separate request that needed the
-                    # wake word again — so "确定" arrived as "小艾同学，确定",
-                    # was not recognised as an answer, and the shutdown was
-                    # silently dropped while the assistant replied to
-                    # something else entirely. A question you have to be
-                    # re-summoned to answer is not a question.
-                    question = CONFIRM_PROMPT.get(lang, CONFIRM_PROMPT["en"]).format(
-                        what=intent.command.describe(lang))
-                    log.info("asking to confirm %s.%s",
-                             intent.plugin.name, intent.command.name)
-                    machine.to(State.SPEAKING)
-                    panel.aia(question)
-                    # Blocking: the answer must not be recorded over our own
-                    # question, and the microphone is drained straight after.
-                    speaker.say(question, lang, blocking=True)
+                # Silence the music FIRST — before the panel, before anything.
+                # The microphone and the speakers share a room, so a command given
+                # over music is captured as the command plus the song, and Whisper
+                # transcribes the mixture. This is the difference between the
+                # assistant working while music plays and not working at all.
+                # Only drop buffered audio if there actually was music in it.
+                # Those buffered frames are the pre-roll the endpointer uses, and
+                # music in them reads as speech to the VAD — it would start the
+                # utterance immediately, then endpoint on the silence that follows
+                # the pause. But draining unconditionally would clip the opening
+                # syllable of "小艾同学播放五月天" said in one breath, which works
+                # today, so it is done only when it buys something.
+                if ducker.duck():
                     mic.drain()
 
-                    machine.to(State.LISTENING)
-                    panel.status(CONFIRM_LISTEN.get(lang, CONFIRM_LISTEN["en"]))
-                    answer_audio = confirm_endpointer.collect(frames)
-                    decision = None
-                    if answer_audio is not None:
-                        # In the language the question was asked in: we are
-                        # holding the floor, so there is nothing to detect.
-                        answer = stt.listen(answer_audio, language=lang)
-                        if answer.text.strip():
-                            panel.user(answer.text)
-                            decision = is_affirmative(answer.text)
-                        log.info("confirmation answer %r -> %s", answer.text, decision)
-                    else:
-                        log.info("no answer to the confirmation")
+                # Shown before anything is transcribed, because the question the
+                # user actually has at this moment is "did it hear me at all?".
+                panel.status(LISTENING_TEXT.get(stt_language, LISTENING_TEXT["en"]))
 
-                    if decision is True:
+                audio = endpointer.collect(frames)
+                turn.mark("captured")
+                if audio is not None and save_audio:
+                    save_utterance(audio, cfg.audio.target_rate, cfg.audio.keep_utterances)
+                if audio is None:
+                    # Nothing was said — a false wake, or the user changed their
+                    # mind. Put the music straight back and take the "Listening…"
+                    # line away rather than leaving it up implying otherwise.
+                    ducker.restore()
+                    panel.hide()
+                    detector.reset()
+                    machine.end_turn()
+                    last_empty_turn = time.monotonic()
+                    continue
+
+                machine.to(State.THINKING)
+                # Bound before the try because `finally` reads it, and `finally`
+                # runs on every exit path — including the early `continue` for a
+                # confirmation reply, and an exception raised before routing.
+                intent = None
+                try:
+                    # Detected fresh every turn, so the user can switch language
+                    # between one command and the next. See stt/engine.py.
+                    result = stt.listen(audio)
+                    turn.mark("stt")
+
+                    # The blank-audio marker is cleared in stt/engine.py, which is
+                    # the only place that knows it is a whisper.cpp artefact.
+                    text = result.text.strip()
+
+                    if not text:
+                        # Apologise in the language of the last turn that *worked*,
+                        # not in `result.language`. Nothing was understood, so this
+                        # transcript has no language to report — it falls back to
+                        # the configured default, which is English, and a Mandarin
+                        # speaker who was misheard would be told "I'm sorry, could
+                        # you repeat that?". The last language they were understood
+                        # in is the best guess available, and this only picks a
+                        # voice; it does not affect how anything is transcribed.
+                        machine.to(State.SPEAKING)
+                        apology = ("I'm sorry, could you repeat that?"
+                                   if stt_language == "en" else "抱歉，请再说一遍。")
+                        panel.aia(apology)
+                        speaker.say(apology, stt_language)
+                        machine.end_turn()
+                        detector.reset()
+                        mic.drain()
+                        continue
+
+                    lang = reply_language(text, fallback=result.language)
+                    stt_language = result.language
+                    # What it heard, before it acts on it — so a misrecognition is
+                    # visible rather than something to infer from a wrong action.
+                    panel.user(text)
+
+                    intent = router.match(text, lang)
+                    turn.mark("routed")
+
+                    if intent is not None and intent.command.confirm:
+                        # Destructive: ask, then KEEP THE FLOOR and listen for the
+                        # answer in this same turn. Asking and then returning to
+                        # idle made the reply a separate request that needed the
+                        # wake word again — so "确定" arrived as "小艾同学，确定",
+                        # was not recognised as an answer, and the shutdown was
+                        # silently dropped while the assistant replied to
+                        # something else entirely. A question you have to be
+                        # re-summoned to answer is not a question.
+                        question = CONFIRM_PROMPT.get(lang, CONFIRM_PROMPT["en"]).format(
+                            what=intent.command.describe(lang))
+                        log.info("asking to confirm %s.%s",
+                                 intent.plugin.name, intent.command.name)
+                        machine.to(State.SPEAKING)
+                        panel.aia(question)
+                        # Blocking: the answer must not be recorded over our own
+                        # question, and the microphone is drained straight after.
+                        speaker.say(question, lang, blocking=True)
+                        mic.drain()
+
+                        machine.to(State.LISTENING)
+                        panel.status(CONFIRM_LISTEN.get(lang, CONFIRM_LISTEN["en"]))
+                        answer_audio = confirm_endpointer.collect(frames)
+                        decision = None
+                        if answer_audio is not None:
+                            # In the language the question was asked in: we are
+                            # holding the floor, so there is nothing to detect.
+                            answer = stt.listen(answer_audio, language=lang)
+                            if answer.text.strip():
+                                panel.user(answer.text)
+                                decision = is_affirmative(answer.text)
+                            log.info("confirmation answer %r -> %s", answer.text, decision)
+                        else:
+                            log.info("no answer to the confirmation")
+
+                        if decision is True:
+                            machine.to(State.ACTING)
+                            reply = intent.command.handler(**intent.arguments).say(lang)
+                            turn.mark("acted")
+                        else:
+                            # Silence, "no", or anything unclear all cancel. For an
+                            # irreversible action "I could not tell" must mean no.
+                            intent = None      # so the music comes back
+                            reply = "Cancelled." if lang == "en" else "已取消。"
+                    elif intent is not None:
                         machine.to(State.ACTING)
-                        reply = intent.command.handler(**intent.arguments).say(lang)
+                        if not intent.plugin.available():
+                            reply = Result.failed(
+                                f"{intent.plugin.description} is not currently running.",
+                                f"{intent.plugin.description} 没有在运行。",
+                            ).say(lang)
+                        else:
+                            outcome = intent.command.handler(**intent.arguments)
+                            reply = outcome.say(lang)
                         turn.mark("acted")
                     else:
-                        # Silence, "no", or anything unclear all cancel. For an
-                        # irreversible action "I could not tell" must mean no.
-                        intent = None      # so the music comes back
-                        reply = "Cancelled." if lang == "en" else "已取消。"
-                elif intent is not None:
-                    machine.to(State.ACTING)
-                    if not intent.plugin.available():
-                        reply = Result.failed(
-                            f"{intent.plugin.description} is not currently running.",
-                            f"{intent.plugin.description} 没有在运行。",
-                        ).say(lang)
-                    else:
-                        outcome = intent.command.handler(**intent.arguments)
-                        reply = outcome.say(lang)
-                    turn.mark("acted")
-                else:
-                    # No known command. M2 puts the LLM here; until then, say
-                    # what was heard so misrecognitions are still diagnosable
-                    # by ear rather than only from the journal.
-                    reply = f"You said: {text}" if lang == "en" else f"你说：{text}"
+                        # No known command. M2 puts the LLM here; until then, say
+                        # what was heard so misrecognitions are still diagnosable
+                        # by ear rather than only from the journal.
+                        reply = f"You said: {text}" if lang == "en" else f"你说：{text}"
 
-                machine.to(State.SPEAKING)
-                # On screen first, then spoken. Writing text costs under a
-                # millisecond while synthesis costs a few hundred, so showing
-                # it first means the reply appears as the voice starts rather
-                # than after it.
-                panel.aia(reply)
-                # Mark when audio STARTS, not when it finishes. Timing a
-                # blocking play charges the whole spoken reply to the turn —
-                # a two-second sentence looked like two seconds of latency,
-                # which made a responsive turn read as 4 s over budget. What
-                # the user experiences is the wait before hearing anything.
-                speaker.say(reply, lang, blocking=False)
-                turn.mark("audio_out")
-                speaker.wait()
+                    machine.to(State.SPEAKING)
+                    # On screen first, then spoken. Writing text costs under a
+                    # millisecond while synthesis costs a few hundred, so showing
+                    # it first means the reply appears as the voice starts rather
+                    # than after it.
+                    panel.aia(reply)
+                    # Mark when audio STARTS, not when it finishes. Timing a
+                    # blocking play charges the whole spoken reply to the turn —
+                    # a two-second sentence looked like two seconds of latency,
+                    # which made a responsive turn read as 4 s over budget. What
+                    # the user experiences is the wait before hearing anything.
+                    speaker.say(reply, lang, blocking=False)
+                    turn.mark("audio_out")
+                    speaker.wait()
 
-            except Exception:
-                log.exception("turn failed")
-                machine.to(State.ERROR)
-                # Say so. A turn that dies here — whisper-server wedged or
-                # restarting is the realistic cause — used to end in silence:
-                # the wake word was acknowledged, the music ducked, "Listening…"
-                # stayed on screen, and then nothing ever came back. From the
-                # outside that is indistinguishable from the assistant having
-                # ignored you, and the only record was in the journal.
-                #
-                # Guarded, because this runs on the path where something has
-                # already gone wrong: if speaking fails too, the original
-                # exception is what matters and it has already been logged.
-                try:
-                    trouble = ("Sorry, something went wrong." if stt_language == "en"
-                               else "抱歉，出错了。")
-                    panel.aia(trouble)
-                    speaker.say(trouble, stt_language)
                 except Exception:
-                    log.exception("could not announce the failed turn")
-            finally:
-                # Bring the music back, but only once the reply has finished
-                # speaking — resuming first would talk over the answer.
-                #
-                # Commands that meant to leave audio stopped opt out: resuming
-                # after "暂停" would undo exactly what was asked for. Anything
-                # that started playback itself is already handled, because
-                # `restore` only resumes players it finds still paused.
-                if intent is not None and intent.command.stops_playback:
-                    ducker.forget()
-                else:
-                    ducker.restore()
-                machine.end_turn()
-                detector.reset()
-                # Drop anything captured while we were talking, so the
-                # assistant does not hear itself.
-                mic.drain()
+                    log.exception("turn failed")
+                    machine.to(State.ERROR)
+                    # Say so. A turn that dies here — whisper-server wedged or
+                    # restarting is the realistic cause — used to end in silence:
+                    # the wake word was acknowledged, the music ducked, "Listening…"
+                    # stayed on screen, and then nothing ever came back. From the
+                    # outside that is indistinguishable from the assistant having
+                    # ignored you, and the only record was in the journal.
+                    #
+                    # Guarded, because this runs on the path where something has
+                    # already gone wrong: if speaking fails too, the original
+                    # exception is what matters and it has already been logged.
+                    try:
+                        trouble = ("Sorry, something went wrong." if stt_language == "en"
+                                   else "抱歉，出错了。")
+                        panel.aia(trouble)
+                        speaker.say(trouble, stt_language)
+                    except Exception:
+                        log.exception("could not announce the failed turn")
+                finally:
+                    # Bring the music back, but only once the reply has finished
+                    # speaking — resuming first would talk over the answer.
+                    #
+                    # Commands that meant to leave audio stopped opt out: resuming
+                    # after "暂停" would undo exactly what was asked for. Anything
+                    # that started playback itself is already handled, because
+                    # `restore` only resumes players it finds still paused.
+                    if intent is not None and intent.command.stops_playback:
+                        ducker.forget()
+                    else:
+                        ducker.restore()
+                    machine.end_turn()
+                    detector.reset()
+                    # Drop anything captured while we were talking, so the
+                    # assistant does not hear itself.
+                    mic.drain()
 
-    detector.close()
-    speaker.close()
-    panel.close()
+    finally:
+        detector.close()
+        speaker.close()
+        panel.close()
+
     return 0
 
 

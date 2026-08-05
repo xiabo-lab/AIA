@@ -69,9 +69,11 @@ systemctl --user daemon-reload
 # allows exactly one reader — the service would fail to start with an error
 # that looks nothing like the real cause.
 log "Stopping any hand-started instance"
-pkill -f "aia.main" 2>/dev/null || true
-pkill -f "aia.ui.overlay" 2>/dev/null || true
-pkill -f "whisper-server" 2>/dev/null || true
+# -f is unavoidable here: these are python processes, whose comm is
+# "python". Anchored on the module path so it cannot match a bare shell.
+pkill -f "python -m aia.main" 2>/dev/null || true
+pkill -f "python -m aia.ui.overlay" 2>/dev/null || true
+pkill -x whisper-server 2>/dev/null || true
 sleep 2
 
 log "Enabling and starting"

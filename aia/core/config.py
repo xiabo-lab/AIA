@@ -27,6 +27,12 @@ class AudioConfig:
     channels: int = 1
     dtype: str = "int16"
 
+    # How many captured utterances AIA_SAVE_AUDIO keeps before pruning the
+    # oldest. Measured at ~148 KB each, so 200 is ~30 MB and roughly a week
+    # of ordinary use — long enough that a misrecognition can still be dug up
+    # after a weekend, bounded so it cannot grow to a gigabyte of SD card.
+    keep_utterances: int = 200
+
     # Substring matched against the portaudio device name. The USB mic
     # enumerates as "USB PnP Sound Device: Audio (hw:2,0)", but the card
     # number moves when other USB audio is plugged in, so match on name.

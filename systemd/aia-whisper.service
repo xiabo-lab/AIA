@@ -8,7 +8,15 @@ Before=aia.service
 
 [Service]
 Type=simple
-ExecStart=%h/AI_Assit/scripts/whisper-server.sh
+# Run through bash rather than executing the script directly, so this does
+# not depend on a file mode. `core.fileMode` is false on the Windows checkout
+# this is authored from, and the first deploy that included scripts/ stripped
+# +x from all six .sh files — surfacing hours later as this unit in a restart
+# loop with 203/EXEC while the assistant sat in "waiting for whisper-server",
+# a symptom that points at whisper, the model, the port, anything but a
+# permission bit. The bit is correct in git and install-service.sh sets it
+# too; this removes the dependency rather than defending it a third time.
+ExecStart=/bin/bash %h/AI_Assit/scripts/whisper-server.sh
 WorkingDirectory=%h/AI_Assit
 
 # The model lives in memory for the life of the process — that is the whole
