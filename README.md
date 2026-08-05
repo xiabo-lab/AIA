@@ -3,18 +3,32 @@
 An offline-first voice assistant that acts as the primary voice interface for the Pi.
 Wake word → speech recognition → intent routing → app control → spoken reply, all on-device.
 
-**Status: M0 passed, M1 built and validated except for the live microphone test.**
+**Status: v0.3.0 — the voice loop and app control work on real speech. The LLM is not built.**
 
-M0 measured the target Pi and every check passed; the fast path lands at **1.46 s** (English)
-and **1.58 s** (Mandarin) against a 2.5 s budget. M1 — the voice loop — is written and each
-stage is verified on the device. The one thing that still needs a human is speaking into the
-microphone; see "Try it" below. Details in `docs/PLAN.md`.
+M0 measured the target Pi and every check passed; the fast path landed at **1.46 s** (English)
+and **1.58 s** (Mandarin) against a 2.5 s budget. M1 — wake word, capture, endpointing, STT,
+routing, TTS — runs on the device and has been reviewed subsystem by subsystem. Anything the
+router does not recognise is repeated back rather than answered: that is M2's job and there is
+no `aia/llm/` yet. Details and milestones in `docs/PLAN.md`.
+
+Requires **Kodama-Lite v0.1.38** or newer for the lyrics commands. Older versions accept the
+request and ignore it — the control endpoint returns 202 for actions it has never heard of, so
+the assistant will say it worked.
 
 ## Languages
 
-English and Mandarin. Cantonese is deferred — Piper has no Cantonese voice and stock Whisper
-is unusable on Cantonese (~49.5% CER). The language layer is kept behind
-`aia/tts/language.py` so adding it later is a branch, not a refactor.
+English and Mandarin, decided **per utterance**. There is no mode to be in and nothing to
+select: say "play some music", then "播放音乐", then switch back, and each is transcribed in
+the language it was spoken in.
+
+That costs about 600 ms against naming a language outright, and it is worth it because the
+failure it removes is not a slightly worse transcript. Whisper does not fail when handed audio
+in a language it was not asked for — it translates. 下一首 came back as "Next one.", 关机 as
+"Guanji.", 播放… as "(Song)": fluent, confident, and impossible to route.
+
+Cantonese is deferred — Piper has no Cantonese voice and stock Whisper is unusable on
+Cantonese (~49.5% CER). The language layer is kept behind `aia/tts/language.py` so adding it
+later is a branch, not a refactor.
 
 ## Design in one picture
 
@@ -27,7 +41,7 @@ Microphone → Wake Word (always on, ~0.6% CPU)
                   ↓
          ┌─── Intent Router ───┐
          │                     │
-   fast path (~50 ms)     slow path
+   fast path (~9 ms)      slow path — NOT BUILT
    phrase match against   Qwen2.5 3B via
    plugin manifests       llama.cpp server
          │                     │
@@ -38,10 +52,12 @@ Microphone → Wake Word (always on, ~0.6% CPU)
               Piper TTS (streaming) → Speaker
 ```
 
-The router tier is the important part. Qwen2.5 3B decodes at ~5–8 tok/s on a Pi 5, so a tool
-call plus a spoken reply is 4–6 seconds of generation alone. Routing every command through
-the LLM cannot meet the 2.5 s target. Known commands ("pause", "next", "play X") are matched
-deterministically in ~50 ms and never touch the LLM; only open-ended conversation does.
+The router tier is the important part. Qwen2.5 3B benchmarks at 5.67 tok/s on an idle Pi 5 —
+and **2.4 tok/s measured with whisper-server and the player actually running**, because both
+engines ask for all four cores. A 30-token reply is therefore closer to 12 s than to the 5 s
+the benchmark suggests. Routing every command through the LLM cannot meet the 2.5 s target
+and never could. Known commands ("pause", "next", "play X") are matched deterministically in
+**~9 ms on the Pi** and never touch a model; only open-ended conversation will.
 
 ## Running the M0 benchmark
 
@@ -105,15 +121,45 @@ publishes at `~/.local/state/kodama-lite/control.json` (mode 0600):
 |---|---|---|
 | play hotel california | 播放五月天 | searches, then plays the results as a queue |
 | search for X | 搜索五月天 | shows results without playing |
+| search song hotel california | 搜索歌曲七里香 | Song Search window, by name |
 | set volume to fifty | 音量调到五十 | volume — understands 五十, 百分之五十, 50 |
 | shuffle / repeat | 随机播放 / 单曲循环 | shuffle, repeat mode |
 | like this song | 点赞 | likes the current track |
-| show lyrics | 显示歌词 | lyrics |
+| show lyrics | 显示歌词 | shows the lyrics already found |
+| search lyric | 搜索歌词 | looks them up again — the karaoke magnifier |
+| save lyric | 保存歌词 | commits them to the cache — the green tick |
 | karaoke | 卡拉OK模式 | full-screen karaoke |
 | close kodama | 退出软件 | quits the app — **asks first** |
 | shut down / reboot | 关机 / 重启 | powers off or restarts — **asks first**
 
+`search lyric` and `search song` are deliberately different actions and never cross: one stays
+on the karaoke screen, the other opens Song Search. They are one syllable apart in Mandarin —
+搜索歌词 and 搜索歌曲 score 0.80 against each other in the pinyin the router compares, above
+the 0.78 it needs to fire — so the separation does not rest on the threshold. It rests on a
+raised score floor for the two no-argument lyric commands, a rule that an argument which is
+itself a command is not an argument, and a bare trigger declining instead of guessing.
+
 Destructive commands need an explicit yes on the following turn; anything ambiguous cancels.
+
+### Microphone level — check this before anything else
+
+A microphone running near full scale cannot be endpointed. webrtcvad calls every frame speech,
+so `silence_ms` is never satisfied and every utterance runs to `max_utterance_ms`, turning a
+two-second command into a ten-second turn. Measured: a capture that is 33% voiced at its own
+level is **100% voiced** once amplified to peak 0.0 dBFS. It takes barely any clipping — real
+captures failed this way at −1.8 and −0.6 dBFS with *no* clipped samples at all.
+
+So capture gain is not a matter of taste:
+
+```bash
+amixer -c <card> sset Mic 8                    # not 16 — leave headroom
+amixer -c <card> sset 'Auto Gain Control' off  # AGC winds gain into the rail
+sudo alsactl store                             # or a reboot reverts both
+```
+
+The symptoms in `journalctl --user -u aia` are `samples clipped at full scale` and
+`too hot to endpoint`. Two USB microphones also enumerate under the *same* name, differing
+only by a card number that moves on re-plug, so AIA warns when more than one input matches.
 
 ### The wake word
 
@@ -153,7 +199,7 @@ aia/
   core/      state machine, event bus, config
   audio/     wake word, VAD, capture
   stt/       whisper.cpp wrapper
-  router/    fast phrase matcher + LLM client
+  router/    fast phrase matcher (the LLM client lands with M2)
   tts/       Piper synthesis, language resolution
   plugins/   plugin ABC + per-app handlers
 docs/PLAN.md the full plan, milestones and open risks
