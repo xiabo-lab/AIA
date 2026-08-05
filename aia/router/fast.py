@@ -44,6 +44,19 @@ SLOT = re.compile(r"\{(\w+)\}")
 
 # How alike an utterance and a trigger must be before the utterance counts as
 # that trigger with its argument left off. See `_is_bare_trigger`.
+#
+# Derived, after being guessed once from a single counter-example. A trigger
+# of length t swallows an argument of length x while 2t / (2t + x) >= k, so
+# x <= 2t(1 - k)/k. At 0.95 that is 1.1 to 1.8 normalised characters across
+# the triggers actually declared, worst at 把音量调到 (1.8). Every real
+# argument is longer, because one Chinese syllable is at least two letters of
+# pinyin: 五 is "wu", 我 is "wo". Confirmed on the device — the tightest cases
+# keep their argument: 把音量调到五 -> volume "五", 搜索歌曲我 -> search_song
+# "我", 播放我 -> play "我".
+#
+# The margin is real but thin, about 0.2 characters at worst. Raising this
+# loses bare-trigger detection; lowering it starts eating one-syllable
+# arguments. Re-derive rather than nudge.
 BARE_TRIGGER = 0.95
 
 # Punctuation Whisper likes to add, which no spoken phrase contains.
@@ -113,11 +126,22 @@ class FastRouter:
         # Commands with an argument match only their trigger, which is short —
         # 播放 is two syllables — so the bar is higher to compensate.
         self.argument_threshold = argument_threshold
+        self._validate_phrases()
         self._whole_cache: list[str] | None = None
         self._whole_lengths: list[int] = []
         self._trigger_cache: list[str] | None = None
 
-    def match(self, text: str, language: str = "en") -> Intent | None:
+    def match(self, text: str) -> Intent | None:
+        """The best command this utterance matches, or None.
+
+        Takes no language. It used to accept one and never read it, which
+        implied a scoping that does not happen — every phrase in every
+        language is always considered, and that is deliberate: it is what
+        lets "帮我 search the weather" match at all, and what lets one
+        command follow another in a different language. Verified identical
+        for "en" and "zh" across the routing corpus before the argument was
+        removed.
+        """
         target = normalise(text)
         if not target:
             return None
@@ -136,12 +160,12 @@ class FastRouter:
             return (
                 intent.score,
                 0 if intent.command.takes_argument else 1,
-                len(SLOT.sub("", intent.matched)),
+                len(normalise(SLOT.sub("", intent.matched))),
             )
 
         candidates: list[Intent] = []
         for plugin, command in self.registry.all_commands():
-            for lang, phrases in command.phrases.items():
+            for phrases in command.phrases.values():
                 for phrase in phrases:
                     found = self._match_phrase(plugin, command, phrase, text, target)
                     if found:
@@ -153,13 +177,12 @@ class FastRouter:
         # question from 19 times an utterance down to 0.8. Losing candidates
         # are reached only when the winner turns out to have eaten a
         # command — which is precisely when the runner-up is what was meant.
-        best: Intent | None = None
-        for intent in sorted(candidates, key=rank, reverse=True):
-            if intent.arguments and self._is_command(next(iter(intent.arguments.values()))):
-                log.debug("%s took a command as its argument; passing over it", intent)
-                continue
-            best = intent
-            break
+        best = max(candidates, key=rank, default=None)
+        while best is not None and best.arguments and self._is_command(
+                next(iter(best.arguments.values()))):
+            log.debug("%s took a command as its argument; passing over it", best)
+            candidates.remove(best)
+            best = max(candidates, key=rank, default=None)
 
         if best is None:
             return None
@@ -197,8 +220,6 @@ class FastRouter:
         # reliable delimiter for "the song name stops here", so anything after
         # the slot in a template is not matchable and is not allowed.
         trigger = phrase[: slot.start()]
-        if phrase[slot.end():].strip():
-            log.warning("phrase %r has text after its slot; ignoring that part", phrase)
 
         argument = self._split_argument(raw, trigger)
         if argument is None:
@@ -211,6 +232,28 @@ class FastRouter:
             plugin, command, {slot.group(1): tail.strip()},
             similarity(normalise(head), normalise(trigger)), phrase,
         )
+
+    def _validate_phrases(self) -> None:
+        """Complain once, at startup, about phrases that cannot work.
+
+        A slot always runs to the end of the utterance, so anything written
+        after it is silently unmatchable. That used to be reported from
+        `_match_phrase`, which runs for every phrase on every utterance — so
+        one bad declaration would have logged a warning per phrase per turn
+        for the life of the process, about something that cannot change while
+        it runs. It is a declaration error, and this is where declarations
+        are read.
+        """
+        for _, command in self.registry.all_commands():
+            for phrases in command.phrases.values():
+                for phrase in phrases:
+                    slot = SLOT.search(phrase)
+                    if slot and phrase[slot.end():].strip():
+                        log.warning(
+                            "%s: phrase %r has text after its slot, which can "
+                            "never match — a slot runs to the end of the "
+                            "utterance. That part is ignored.",
+                            command.name, phrase)
 
     def _whole_phrases(self) -> list[str]:
         """Every phrase that is a complete command on its own, normalised.

@@ -344,7 +344,7 @@ def main() -> int:
                     # visible rather than something to infer from a wrong action.
                     panel.user(text)
 
-                    intent = router.match(text, lang)
+                    intent = router.match(text)
                     turn.mark("routed")
 
                     if intent is not None and intent.command.confirm:
