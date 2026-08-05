@@ -78,6 +78,12 @@ CONFIRM_LISTEN = {"en": "Say yes or no…", "zh": "请回答“确定”或“�
 # after a false one is not swallowed.
 EMPTY_TURN_REFRACTORY_S = 1.0
 
+# Never prune the utterance directory below this, whatever `keep_utterances`
+# says. Recordings cannot be remade — they are a particular speaker, room and
+# microphone on a particular day — so an implausibly small value is a mistake
+# rather than a request. See `save_utterance`.
+_MIN_KEEP = 25
+
 _YES = ("yes", "yeah", "yep", "sure", "confirm", "do it", "go ahead", "ok", "okay",
         "是", "是的", "对", "确定", "确认", "好", "好的", "可以", "没错")
 _NO = ("no", "nope", "cancel", "stop", "don't", "never mind", "abort",
@@ -170,6 +176,17 @@ def save_utterance(audio, rate: int, keep: int) -> None:
         w.setframerate(rate)
         w.writeframes(audio.tobytes())
     log.info("saved utterance to %s", path)
+
+    # A floor under the floor. Pruning deletes real recordings that cannot be
+    # made again — the same speaker, room and microphone on a particular day —
+    # so a small `keep` is far more likely to be a mistake than an intention.
+    # This is not hypothetical: a test called this with keep=3 against the
+    # live directory and took 101 captures down to 3, and the numbers derived
+    # from them survive only because they were written into commit messages.
+    if keep < _MIN_KEEP:
+        log.warning("keep=%d is below the %d-file floor; keeping %d instead",
+                    keep, _MIN_KEEP, _MIN_KEEP)
+        keep = _MIN_KEEP
 
     # Names are timestamps, so sorting by name is sorting by age.
     existing = sorted(directory.glob("*.wav"))
