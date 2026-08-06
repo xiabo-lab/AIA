@@ -220,20 +220,25 @@ on the Pi, or forward it over ssh (`ssh -L 8090:127.0.0.1:8090 raspberrypi5`).
 
 ### As a desktop app
 
-`scripts/aia-ui.sh` opens it as a full-screen kiosk window — all 1920x440,
-**taskbar included**, so there is no panel to click while it is up. **Alt+F4
-closes it.** Install the launcher on the Pi:
+`scripts/aia-ui.sh` opens it as a maximised Chromium app window — the same
+shape Kodama-Lite runs in, filling the screen below the taskbar. Install the
+launcher on the Pi:
 
 ```bash
 cp ~/AI_Assit/scripts/aia-ui.desktop ~/Desktop/
 cp ~/AI_Assit/scripts/aia-ui.desktop ~/.local/share/applications/
 ```
 
+**Maximised and not full-screen, on purpose.** Full-screen covers the taskbar,
+and on this machine that is a one-way door: labwc's `rc.xml` binds no Close
+action at all — there is no Alt+F4 — and `window.close()` does not close a
+Chromium app window either. On a touch-only display that leaves a window with
+no panel, no titlebar and no way out. Maximised costs 28 px of 440 and keeps
+both the taskbar and a titlebar close button under your finger.
+
 The script waits for the server before opening, so pressing it at boot lands on
-the UI rather than on Chromium's "site can't be reached" — which in kiosk mode
-needs a reload there is no way to reach. Its own flags are commented in place;
-`--kiosk` rather than `--start-fullscreen` and a private `--user-data-dir` are
-both load-bearing.
+the UI rather than on Chromium's "site can't be reached" — which an `--app`
+window has no address bar to get off. Its other flags are commented in place.
 
 ### The taskbar must stay at the top
 
