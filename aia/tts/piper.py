@@ -141,15 +141,67 @@ class Speaker:
         ]
 
     def warm(self) -> None:
-        """Force each voice to load now, off the critical path.
+        """Force each voice to load now, off the critical path, and prove the
+        output device can be opened.
 
-        Without this the first command of the session pays up to 1.2 s of ONNX
-        load on top of everything else.
+        Without the synthesis half, the first command of the session pays up to
+        1.2 s of ONNX load on top of everything else.
+
+        The playback half exists because synthesis succeeding says nothing
+        about whether anyone will hear it. This warmed both voices and logged
+        two cheerful timings every boot for a day while the output device was
+        gone entirely — PipeWire held the only HDMI sink, PortAudio had no
+        usable output at all, and every reply was synthesised and dropped. The
+        assistant looked healthy in the log from startup right up until someone
+        in the room noticed it had stopped talking.
         """
         for lang, voice in self._voices.items():
             t0 = time.monotonic()
             voice.synth("Ready." if lang == "en" else "准备好了。")
             log.info("warmed %s voice in %.0f ms", lang, (time.monotonic() - t0) * 1000)
+        self.probe_output()
+
+    def probe_output(self) -> bool:
+        """Play a short quiet tone to prove the output path works. True if heard.
+
+        Deliberately does **not** stop the assistant when it fails. An AIA that
+        can hear and act but not speak is degraded; one that refuses to start
+        is useless, and the realistic cause — a sink held by something else, an
+        HDMI display not awake yet — is both transient and outside our control.
+        So this reports at ERROR and returns, and the log says plainly that
+        replies will be silent rather than leaving it to be inferred from an
+        absence.
+        """
+        rate = next(iter(self._voices.values())).sample_rate if self._voices \
+            else self.cfg.sample_rate
+        tone = self._test_tone(rate)
+
+        t0 = time.monotonic()
+        ok = self._play(tone, rate, blocking=True)
+        if ok:
+            log.info("audio output ready (%.0f ms for the probe tone)",
+                     (time.monotonic() - t0) * 1000)
+        else:
+            log.error("AUDIO OUTPUT IS DEAD — every reply will be synthesised "
+                      "and never heard. Commands still work; nothing will be "
+                      "spoken.")
+        return ok
+
+    @staticmethod
+    def _test_tone(rate: int, ms: int = 120, hz: float = 660.0,
+                   amplitude: float = 0.06) -> np.ndarray:
+        """A short, quiet beep with the edges taken off.
+
+        Quiet because it fires on every start and nobody wants their assistant
+        to announce itself at full scale. Enveloped because a tone that starts
+        and stops at a non-zero sample is a click, which is louder and nastier
+        than the tone itself.
+        """
+        n = max(1, int(rate * ms / 1000))
+        t = np.arange(n, dtype=np.float64) / rate
+        envelope = np.sin(np.pi * np.arange(n) / n) ** 2
+        wave = np.sin(2 * np.pi * hz * t) * envelope * amplitude
+        return (wave * 32767).astype(np.int16)
 
     def say(self, text: str, language: str = "en", blocking: bool = True) -> float:
         """Speak `text`. Returns milliseconds to first audio."""
@@ -167,8 +219,12 @@ class Speaker:
         return first_audio_ms
 
     @staticmethod
-    def _play(samples: np.ndarray, rate: int, blocking: bool) -> None:
+    def _play(samples: np.ndarray, rate: int, blocking: bool) -> bool:
         """Play, retrying briefly if the output device is momentarily busy.
+
+        Returns whether the samples reached the device. `say()` ignores that —
+        a lost reply is survivable and has already been logged — but
+        `probe_output` is asking the question on purpose.
 
         The Pi's only sink is HDMI, and it is not always instantly available —
         a "Device unavailable" here is usually contention that clears in a
@@ -191,7 +247,7 @@ class Speaker:
                     # Survivable: the command itself has already run, and the
                     # panel has already shown the reply on screen.
                     log.error("audio output unavailable, reply not spoken: %s", exc)
-                    return
+                    return False
                 log.warning("audio output busy (%s); retrying", exc)
                 time.sleep(0.2)
 
@@ -200,6 +256,7 @@ class Speaker:
                 sd.wait()
             except Exception:
                 log.debug("sd.wait() failed", exc_info=True)
+        return True
 
     def wait(self) -> None:
         """Block until playback finishes.
