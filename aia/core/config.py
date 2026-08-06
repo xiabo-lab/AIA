@@ -252,12 +252,92 @@ class VadConfig:
 
 
 @dataclass(frozen=True)
+class SenseVoiceConfig:
+    """SenseVoiceSmall INT8, run in-process through sherpa-onnx.
+
+    The default recogniser. Fetch the model with `scripts/get_sensevoice.sh`;
+    nothing here is downloaded at runtime and nothing here talks to a network
+    service, which is the point — STT is offline, with no API key and no cloud
+    fallback to quietly succeed when the model is missing.
+    """
+
+    # The official multilingual release: zh, en, ja, ko, yue. The archive
+    # carries both precisions and this names the INT8 one explicitly, because
+    # `model.onnx` beside it is the fp32 weights and picking it up by accident
+    # would present as "SenseVoice is slower than advertised" rather than as a
+    # wrong file.
+    directory: Path = MODELS / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    model_name: str = "model.int8.onnx"
+    tokens_name: str = "tokens.txt"
+
+    # Start at 2 and measure 1/2/3/4 before moving it. The Pi 5 has four cores
+    # and this is not the only thing on them — the wake recogniser runs
+    # continuously, and Piper wants a core the moment the transcript lands, so
+    # the fastest setting for STT in isolation is not necessarily the fastest
+    # turn. `scripts/stt_test.py --threads 1,2,3,4` sweeps it.
+    num_threads: int = 2
+
+    # "auto", or one of the five the model knows. Leave it on "auto": naming a
+    # language is what broke bilingual use under Whisper, and the whole reason
+    # this household has an assistant that listens in three languages is that
+    # nobody should have to select one. See aia/stt/sensevoice.py.
+    language: str = "auto"
+
+    # Inverse text normalisation — "二零二五" comes back as "2025", and
+    # sentences arrive punctuated. Wanted: the router strips punctuation before
+    # matching anyway, and digits are what the number-taking commands parse.
+    use_itn: bool = True
+
+    # onnxruntime execution provider. "cpu" is the only one that exists on this
+    # Pi; the field is here so that trying anything else is a config change
+    # rather than a code change.
+    provider: str = "cpu"
+
+    # What the model can be asked to recognise, as opposed to what AIA can
+    # answer in. Those are different sets and conflating them is what this
+    # field exists to prevent: Cantonese is recognised and then answered in
+    # Mandarin, because Piper has no yue voice. See SttConfig.supported_languages.
+    recognised_languages: tuple[str, ...] = ("zh", "en", "yue")
+
+    @property
+    def model(self) -> Path:
+        return self.directory / self.model_name
+
+    @property
+    def tokens(self) -> Path:
+        return self.directory / self.tokens_name
+
+    @property
+    def is_auto(self) -> bool:
+        return self.language.strip().lower() in ("auto", "")
+
+
+@dataclass(frozen=True)
 class SttConfig:
+    # Which recogniser runs. "sensevoice" is the default and "whisper" is kept
+    # as the fallback — it is the only transcriber here with a measured
+    # accuracy record on real captures from this room, and a comparison needs
+    # both halves present.
+    #
+    # The environment variable is for running one recording through both
+    # without editing the file the other is being measured from.
+    backend: str = field(
+        default_factory=lambda: os.environ.get("AIA_STT_BACKEND", "sensevoice"))
+
+    sensevoice: SenseVoiceConfig = field(default_factory=SenseVoiceConfig)
+
+    # ── whisper.cpp, the fallback backend ────────────────────────────
     host: str = "127.0.0.1"
     port: int = 8081
     model: Path = MODELS / "ggml-base.bin"
 
-    # The single most valuable setting in this file. Whisper runs its encoder
+    # The single most valuable setting in this file *for the whisper backend*,
+    # and meaningless for SenseVoice, which is not autoregressive and has no
+    # padded window to cap — its cost tracks the real length of the audio.
+    # `__post_init__` only enforces the capture-length invariant below when
+    # whisper is the backend selected, for the same reason.
+    #
+    # Whisper runs its encoder
     # over a padded 30 s window no matter how short the clip is; capping the
     # audio context to ~10 s cut encode from 1564 ms to 378 ms on this Pi with
     # no change to the transcripts. Below ~512 the decoder starts falling back
@@ -283,6 +363,14 @@ class SttConfig:
     # Only used when auto_detect is off, or when a transcript is empty and
     # there is no script to read a language from.
     default_language: str = "en"
+
+    # The languages AIA can *answer* in — one Piper voice each. This is NOT the
+    # set the recogniser can hear: SenseVoice also returns `yue`, and AIA
+    # answers Cantonese in Mandarin because there is no Cantonese voice to
+    # answer it with. Adding `yue` here without adding a voice would route a
+    # Cantonese turn to `Speaker.say("yue")`, which falls back to whichever
+    # voice happens to be first in the dict — the silent kind of wrong.
+    # `SenseVoiceConfig.recognised_languages` is the other set.
     supported_languages: tuple[str, ...] = ("en", "zh")
 
     # How long to wait on the server before giving up. This is a bound on a
@@ -454,13 +542,32 @@ class Config:
         config.py, so it is a developer error caught the first time the
         process starts, not something a user can trigger.
         """
-        readable = self.stt.readable_audio_ms
-        if self.vad.max_utterance_ms > readable:
+        # Whisper only. SenseVoice reads whatever it is given — there is no
+        # fixed encoder window to overrun — so applying this to it would be
+        # enforcing an invariant that does not exist, and would make
+        # `max_utterance_ms` look like it had been chosen for a reason it had
+        # not. The number stays at 10000 for both because it is *also* about
+        # how long the assistant may sit in a noisy room, which is unchanged.
+        if self.stt.backend.strip().lower() == "whisper":
+            readable = self.stt.readable_audio_ms
+            if self.vad.max_utterance_ms > readable:
+                raise ValueError(
+                    f"vad.max_utterance_ms={self.vad.max_utterance_ms} exceeds what "
+                    f"whisper will read at stt.audio_ctx={self.stt.audio_ctx} "
+                    f"({readable} ms). Audio past that is discarded silently. "
+                    f"Raise audio_ctx or lower max_utterance_ms."
+                )
+
+        # Both recognisers and the wake word are 16 kHz models. Nothing here
+        # breaks loudly at another rate — sherpa-onnx would resample on the
+        # voice path, and whisper would be handed a WAV header it believed —
+        # so a mismatch presents as latency or as confident wrong text rather
+        # than as an error. `AudioConfig.capture_rate` is the one to change if
+        # the microphone cannot do 48 kHz; this is what the models want.
+        if self.audio.target_rate != 16000:
             raise ValueError(
-                f"vad.max_utterance_ms={self.vad.max_utterance_ms} exceeds what "
-                f"whisper will read at stt.audio_ctx={self.stt.audio_ctx} "
-                f"({readable} ms). Audio past that is discarded silently. "
-                f"Raise audio_ctx or lower max_utterance_ms."
+                f"audio.target_rate={self.audio.target_rate} but the STT and wake "
+                f"models are all 16 kHz. Decimate to 16000 in capture instead."
             )
 
         # Two rules delete recordings and they must not contradict each other.

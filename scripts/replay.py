@@ -29,7 +29,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aia.core.config import CONFIG  # noqa: E402
-from aia.stt.engine import SpeechToText  # noqa: E402
+from aia.stt import build as build_stt  # noqa: E402
 from aia.tts.language import reply_language  # noqa: E402
 from aia.tts.piper import Speaker  # noqa: E402
 
@@ -62,9 +62,11 @@ def main() -> int:
         format="%(levelname)-7s %(name)-18s %(message)s",
     )
 
-    stt = SpeechToText(CONFIG.stt, CONFIG.audio.target_rate)
+    stt = build_stt(CONFIG.stt, CONFIG.audio.target_rate)
     if not stt.wait_ready(timeout=30):
-        print("whisper-server is not answering — ./scripts/run_services.sh start")
+        print(f"stt backend {CONFIG.stt.backend!r} is not usable — see the error above.")
+        print("  sensevoice: ./scripts/get_sensevoice.sh")
+        print("  whisper:    ./scripts/run_services.sh start")
         return 1
 
     speaker = Speaker(CONFIG.tts)
@@ -105,6 +107,7 @@ def main() -> int:
               f"  {'PASS' if ok else 'FAIL'}")
 
     speaker.close()
+    stt.close()
     print("\n" + ("All within budget." if overall_ok else "Over budget — see above."))
     return 0 if overall_ok else 1
 

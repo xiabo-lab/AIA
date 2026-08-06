@@ -4,7 +4,7 @@
 
   One file, no build step, no dependencies — it is served by a stdlib HTTP
   handler from inside the assistant process and rendered on a Pi 5 that is also
-  running a wake recogniser, whisper.cpp and a music player.
+  running a wake recogniser, a speech recogniser and a music player.
 
   Sized for the 1920x440 display: everything vertical is scarce, so the header
   is one short row and the chat gets the rest. Settings uses the width instead,
@@ -375,14 +375,34 @@ async function loadSystem() {
     ["Python", d.aia.python],
   ]));
 
-  out.push(card("Speech to text", [
+  // Two backends, and they do not describe themselves with the same fields:
+  // SenseVoice has a thread count and no server, whisper has a server and an
+  // audio context. Rows are therefore added only where the value exists,
+  // rather than printing "undefined" for whichever engine is not running.
+  //
+  // "Recognises" and "Answers in" are deliberately two rows. They are
+  // different sets — Cantonese is understood and then answered in Mandarin,
+  // because there is no Cantonese voice — and collapsing them into one line
+  // would make the settings page claim an ability the device does not have.
+  const sttRows = [
     ["Engine", d.stt.engine],
     ["Model", modelLabel(d.stt.model), d.stt.model.present ? null : "bad"],
     ["Language", d.stt.language],
-    ["Supported", d.stt.supported_languages.join(", ")],
-    ["Audio context", d.stt.audio_ctx + " (" + (d.stt.readable_audio_ms / 1000) + " s readable)"],
-    ["Server", d.stt.url, "mono"],
-  ]));
+    ["Recognises", (d.stt.recognised_languages || []).join(", ")],
+    ["Answers in", (d.stt.reply_languages || []).join(", ")],
+  ];
+  if (d.stt.tokens) {
+    sttRows.push(["Tokens", d.stt.tokens.present ? "present" : "missing",
+      d.stt.tokens.present ? "good" : "bad"]);
+  }
+  if (d.stt.num_threads) sttRows.push(["Threads", String(d.stt.num_threads)]);
+  if (d.stt.load_ms) sttRows.push(["Model load", d.stt.load_ms + " ms"]);
+  if (d.stt.audio_ctx) {
+    sttRows.push(["Audio context",
+      d.stt.audio_ctx + " (" + (d.stt.readable_audio_ms / 1000) + " s readable)"]);
+  }
+  if (d.stt.url) sttRows.push(["Server", d.stt.url, "mono"]);
+  out.push(card("Speech to text", sttRows));
 
   const voices = (d.tts.voices || []).map((v) => [
     "Voice · " + v.language,

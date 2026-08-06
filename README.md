@@ -26,18 +26,22 @@ the assistant will say it worked.
 
 ## Languages
 
-English and Mandarin, decided **per utterance**. There is no mode to be in and nothing to
-select: say "play some music", then "播放音乐", then switch back, and each is transcribed in
-the language it was spoken in.
+Mandarin, Cantonese and English, decided **per utterance**. There is no mode to be in and
+nothing to select: say "play some music", then "播放音乐", then switch back, and each is
+transcribed in the language it was spoken in. Nothing is translated on the way through —
+搜索 Taylor Swift 的歌词 reaches the router exactly as it was said.
 
-That costs about 600 ms against naming a language outright, and it is worth it because the
-failure it removes is not a slightly worse transcript. Whisper does not fail when handed audio
-in a language it was not asked for — it translates. 下一首 came back as "Next one.", 关机 as
-"Guanji.", 播放… as "(Song)": fluent, confident, and impossible to route.
+Getting this wrong is not a slightly worse transcript. A recogniser handed audio in a language
+it was not asked for does not fail, it translates: under the old Whisper backend 下一首 came
+back as "Next one.", 关机 as "Guanji.", 播放… as "(Song)" — fluent, confident, and impossible
+to route. That is why the language is detected on every utterance and never held across a
+conversation.
 
-Cantonese is deferred — Piper has no Cantonese voice and stock Whisper is unusable on
-Cantonese (~49.5% CER). The language layer is kept behind `aia/tts/language.py` so adding it
-later is a branch, not a refactor.
+**Cantonese is understood and answered in Mandarin.** The recogniser tags it as `yue` and
+transcribes it as Cantonese; Piper still ships no `yue` voice, so the reply comes back in the
+Mandarin voice. The two halves are deliberately separate — `_REPLY_IN` in
+`aia/stt/sensevoice.py` decides the voice, `aia/tts/language.py` owns the table — so adding a
+Cantonese voice later is a row and a model file.
 
 ## Design in one picture
 
@@ -46,7 +50,7 @@ Microphone → Wake Word (always on, ~0.6% CPU)
                   ↓
             VAD endpointing
                   ↓
-          STT (whisper.cpp, ggml-base)
+     STT (sherpa-onnx, SenseVoiceSmall INT8)
                   ↓
          ┌─── Intent Router ───┐
          │                     │
@@ -91,10 +95,46 @@ Flags:
 --quick           fewer repetitions, rougher numbers
 ```
 
+## Speech recognition
+
+**SenseVoiceSmall INT8, via sherpa-onnx, loaded once inside the assistant process.** Fetch the
+model on the Pi before installing the service — it is ~230 MB and deliberately not in git,
+because deploys go over `git archive | ssh`:
+
+```bash
+./scripts/get_sensevoice.sh
+.venv/bin/python scripts/stt_test.py --selftest
+```
+
+STT is offline. That fetch is the only step that touches a network, it happens once, and
+nothing at runtime downloads anything or calls an API. A missing model stops AIA at startup
+with a line saying so, rather than falling back to something that would.
+
+whisper.cpp is kept as the fallback backend and still has the only measured accuracy record on
+real captures from this room. Switch with `stt.backend` in `aia/core/config.py`, or for one
+run:
+
+```bash
+systemctl --user enable --now aia-whisper.service   # it needs its server
+AIA_STT_BACKEND=whisper python -m aia.main
+```
+
+Measure them against each other on the Pi, on the same recordings, in one process:
+
+```bash
+systemctl --user stop aia                                   # the mic allows one reader
+.venv/bin/python scripts/stt_test.py record                 # once, with a person
+.venv/bin/python scripts/stt_test.py run --backend both
+.venv/bin/python scripts/stt_test.py run --threads 1,2,3,4
+```
+
+`record` needs somebody in the room: there is no Cantonese audio in this project and none can
+be synthesised. Everything after it is repeatable with nobody present.
+
 ## Running it
 
-AIA runs as a pair of systemd **user** services and starts with the desktop
-session — user services rather than system ones because it needs the session bus
+AIA runs as a systemd **user** service and starts with the desktop
+session — a user service rather than a system one because it needs the session bus
 (to drive the player over MPRIS) and the Wayland display (for the overlay):
 
 ```bash
@@ -112,13 +152,12 @@ To run it by hand instead — say, to try an environment variable:
 ```bash
 cd ~/AI_Assit
 systemctl --user stop aia              # the microphone allows one reader
-./scripts/run_services.sh start        # resident whisper-server on :8081
 . .venv/bin/activate
 python -m aia.main                     # then say 小艾同学, pause, then speak
 ```
 
 It now controls music. Anything it doesn't recognise as a command, it repeats back (the LLM
-that will handle those arrives in M2). Try both languages in one session — nothing to change.
+that will handle those arrives in M2). Try all three languages in one session — nothing to change.
 
 | say (English) | say (Mandarin) | does |
 |---|---|---|
@@ -348,7 +387,7 @@ its own toolbar. `Alt+F11` (once bound, see above) gets out of it.
 aia/
   core/      state machine, config, system information
   audio/     wake word, VAD, capture
-  stt/       whisper.cpp wrapper
+  stt/       backends: SenseVoice (default), whisper.cpp (fallback)
   router/    fast phrase matcher (the LLM client lands with M2)
   tts/       Piper synthesis, language resolution
   plugins/   plugin ABC + per-app handlers

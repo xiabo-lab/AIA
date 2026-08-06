@@ -3,8 +3,8 @@
 A single static page and two JSON endpoints, served from a daemon thread inside
 the assistant process. Deliberately the smallest thing that answers the two
 questions people actually have — *what did it hear me say?* and *what is it
-running?* — because this shares a Pi 5 with a wake recogniser, whisper.cpp and
-a music player, all of which want the same four cores.
+running?* — because this shares a Pi 5 with a wake recogniser, a speech
+recogniser and a music player, all of which want the same four cores.
 
 Why this and not more of the GTK overlay: the overlay is a layer-shell surface
 with keyboard mode NONE, which is what stops it stealing focus from the

@@ -1,13 +1,23 @@
 [Unit]
 Description=AIA voice assistant
+# Ordering only — `After=` without `Wants=`, and that is the whole point.
+#
+# The default recogniser is SenseVoice, which loads inside this process and
+# needs no service at all. `Wants=` used to be here and would still pull
+# whisper-server in, so the Pi would load a second speech model, hold ~150 MB
+# and take a core off the music player, for a backend nothing was using.
+#
+# Whisper is still supported as the fallback (`stt.backend`, or
+# AIA_STT_BACKEND=whisper). Enable its unit yourself when you want it:
+#
+#     systemctl --user enable --now aia-whisper.service
+#
+# This line then orders the two correctly when both start together.
 After=aia-whisper.service
-Wants=aia-whisper.service
-# Retry forever, on purpose. The commonest reason this exits non-zero is
-# whisper-server not answering within 60 s, and on a device that starts with
-# the car the right response is to keep trying rather than to give up at some
+# Retry forever, on purpose. On a device that starts with the car the right
+# response to a failed start is to keep trying rather than to give up at some
 # arbitrary count and stay dead until somebody notices. Systemd's default
-# would stop after 5 starts in 10 s; the 60 s wait means that never triggers
-# anyway, so this states the intent rather than leaving it to arithmetic.
+# would stop after 5 starts in 10 s.
 StartLimitIntervalSec=0
 
 
@@ -48,7 +58,8 @@ Restart=on-failure
 RestartSec=5
 
 
-# Loading the wake model, both Piper voices and waiting for whisper-server.
+# Loading the wake model, the SenseVoice graph and both Piper voices — or,
+# on the whisper backend, waiting for whisper-server to answer.
 TimeoutStartSec=120
 
 # Speech recognition and the wake word are CPU-hungry, but the foreground

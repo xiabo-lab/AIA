@@ -6,3 +6,14 @@ requests
 vosk
 openwakeword
 setuptools
+# Toneless pinyin, so Mandarin commands are matched by sound rather than by
+# character — which is what makes the router survive homophone errors, the
+# overwhelming majority of what a recogniser gets wrong in Mandarin.
+# `router/fast.py` has always imported this and only warned when it was
+# absent, so it was possible to run with Mandarin matching silently degraded.
+pypinyin
+# Speech recognition: SenseVoiceSmall INT8, in-process. The wheel carries its
+# own onnxruntime and ships aarch64 builds, so the Pi installs from PyPI like
+# anything else. The model itself is NOT bundled — fetch it once with
+# scripts/get_sensevoice.sh.
+sherpa-onnx

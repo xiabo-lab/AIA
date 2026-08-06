@@ -39,13 +39,28 @@ fi
 log "Checking prerequisites"
 missing=0
 check() { [[ -e "$2" ]] && echo "  ok   $1" || { echo "  MISSING  $1 ($2)"; missing=1; }; }
+SENSEVOICE="$ROOT/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 check "virtualenv"        "$ROOT/.venv/bin/python"
-check "whisper-server"    "$ROOT/vendor/whisper.cpp/build/bin/whisper-server"
-check "whisper model"     "$ROOT/models/ggml-base.bin"
+check "SenseVoice model"  "$SENSEVOICE/model.int8.onnx"
+check "SenseVoice tokens" "$SENSEVOICE/tokens.txt"
 check "wake-word model"   "$ROOT/models/vosk-model-small-cn-0.22"
 check "English voice"     "$ROOT/models/en_US-lessac-medium.onnx"
 check "Mandarin voice"    "$ROOT/models/zh_CN-huayan-medium.onnx"
-(( missing )) && { warn "Run scripts/bench_m0.sh and scripts/get_wake_model.sh first."; exit 1; }
+(( missing )) && {
+  warn "Run scripts/get_sensevoice.sh, scripts/bench_m0.sh and scripts/get_wake_model.sh first."
+  exit 1
+}
+
+# Whisper is the fallback backend, not a requirement. Its absence is a note,
+# not a failure — checked separately for exactly that reason, because folding
+# it into the block above would refuse to install a working assistant over a
+# model it is not going to load.
+whisper_ok=1
+for f in "$ROOT/vendor/whisper.cpp/build/bin/whisper-server" "$ROOT/models/ggml-base.bin"; do
+  [[ -e "$f" ]] || whisper_ok=0
+done
+(( whisper_ok )) && echo "  ok   whisper fallback" \
+                 || echo "  --   whisper fallback (not built; SenseVoice does not need it)"
 
 # The units hardcode %h/AI_Assit; anywhere else and they would silently point
 # at nothing.
@@ -77,13 +92,18 @@ pkill -x whisper-server 2>/dev/null || true
 sleep 2
 
 log "Enabling and starting"
-systemctl --user enable --now aia-whisper.service
+# Only `aia`. SenseVoice loads inside it, so enabling aia-whisper here would
+# start a second speech model that nothing is going to send audio to — ~150 MB
+# and a core, on a device where four cores are the constraint the whole design
+# is written around. The unit is installed and ready; enable it if you switch
+# `stt.backend` back to whisper.
 systemctl --user enable --now aia.service
 
 sleep 12
 log "Status"
 for unit in "${UNITS[@]}"; do
-  printf '  %-22s %s\n' "$unit" "$(systemctl --user is-active "$unit")"
+  printf '  %-22s %-10s %s\n' "$unit" "$(systemctl --user is-active "$unit")" \
+    "$(systemctl --user is-enabled "$unit" 2>/dev/null)"
 done
 
 cat <<'NOTE'
@@ -94,5 +114,12 @@ cat <<'NOTE'
     systemctl --user restart aia       after changing the code
     systemctl --user stop aia          free the microphone (for wake_test.py)
     ./scripts/install-service.sh --uninstall
+
+  Speech recognition is SenseVoiceSmall INT8, in-process. To run the whisper
+  fallback instead:
+
+    systemctl --user enable --now aia-whisper.service
+    systemctl --user edit aia          # add: Environment=AIA_STT_BACKEND=whisper
+    systemctl --user restart aia
 
 NOTE

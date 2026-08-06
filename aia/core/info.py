@@ -52,10 +52,16 @@ class SystemInfo:
     precisely when somebody goes looking at it.
     """
 
-    def __init__(self, cfg: Config, *, mic=None, speaker=None, started: float | None = None):
+    def __init__(self, cfg: Config, *, mic=None, speaker=None, stt=None,
+                 started: float | None = None):
         self.cfg = cfg
         self.mic = mic
         self.speaker = speaker
+        # Stored as `engine`, not `stt`, because `stt()` below is a method and
+        # `self.stt = stt` silently replaces it with the object — every other
+        # live subsystem here happens to have a name that does not collide
+        # with its section's, and this one does.
+        self.engine = stt
         self.started = time.time() if started is None else started
 
     # ── sections ─────────────────────────────────────────────────────
@@ -72,20 +78,45 @@ class SystemInfo:
         }
 
     def stt(self) -> dict:
+        """The recogniser that is actually running, asked directly.
+
+        This used to name whisper.cpp as a string constant. With two backends
+        that would be a settings page confidently reporting the wrong engine
+        the moment anyone set `AIA_STT_BACKEND` — which is exactly the class of
+        answer this module exists to stop giving, and the reason it reads live
+        objects instead of config elsewhere.
+        """
         stt = self.cfg.stt
-        return {
-            "engine": "whisper.cpp (whisper-server)",
-            "model": _file(stt.model),
-            "url": stt.url,
-            # The setting the whole latency budget rests on, and the one most
-            # likely to be quietly different from what someone assumes.
-            "audio_ctx": stt.audio_ctx,
-            "readable_audio_ms": stt.readable_audio_ms,
+        backend = stt.backend.strip().lower()
+        out: dict = {
+            "backend": backend,
             "language": ("detected per utterance" if stt.auto_detect
                          else stt.default_language),
-            "supported_languages": list(stt.supported_languages),
-            "timeout_s": stt.timeout_s,
+            # Two different sets, kept visibly apart: what can be heard, and
+            # what AIA has a voice to answer in. Cantonese is in the first and
+            # not the second.
+            "recognised_languages": list(stt.sensevoice.recognised_languages)
+            if backend == "sensevoice" else list(stt.supported_languages),
+            "reply_languages": list(stt.supported_languages),
         }
+        if backend == "sensevoice":
+            out["model"] = _file(stt.sensevoice.model)
+            out["tokens"] = _file(stt.sensevoice.tokens)
+        else:
+            out["model"] = _file(stt.model)
+
+        # The live backend's own account of itself, where there is one. Before
+        # `main()` has built it — or in a test — the config above is all there
+        # is, and saying so is better than implying a loaded model.
+        if self.engine is not None:
+            try:
+                out.update(self.engine.describe())
+            except Exception:
+                log.exception("could not describe the stt backend")
+                out["engine"] = "unavailable"
+        else:
+            out["engine"] = "not started"
+        return out
 
     def tts(self) -> dict:
         out: dict = {

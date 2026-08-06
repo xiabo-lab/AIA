@@ -42,7 +42,8 @@ from aia.plugins.base import Registry, Result
 from aia.plugins.kodama import KodamaLite
 from aia.plugins.system import System
 from aia.router.fast import FastRouter, normalise
-from aia.stt.engine import SpeechToText, detect_script
+from aia.stt import build as build_stt
+from aia.stt import detect_script
 from aia.tts.language import reply_language
 from aia.tts.piper import Speaker
 from aia.ui.history import ConversationLog
@@ -223,15 +224,20 @@ def main() -> int:
     retention = Retention(cfg.retention, history)
     retention.start()
 
-    # The rate is passed, not defaulted. `SpeechToText` writes it into the WAV
-    # header, and a header that disagrees with the samples does not fail — it
-    # transcribes a pitch-shifted signal and returns confident nonsense. Same
-    # trap as the wake recogniser built at a hardcoded 16 kHz.
-    stt = SpeechToText(cfg.stt, cfg.audio.target_rate)
-    log.info("waiting for whisper-server at %s", cfg.stt.url)
+    # Which recogniser this is depends on `stt.backend`; nothing below this
+    # line knows or cares. The rate is passed, not defaulted — both backends
+    # need it and both have a way of being silently wrong without it, see
+    # aia/stt/__init__.py.
+    stt = build_stt(cfg.stt, cfg.audio.target_rate)
+    log.info("starting stt backend %r", cfg.stt.backend)
     if not stt.wait_ready():
-        log.error("whisper-server never answered. Start it: ./scripts/run_services.sh start")
+        # SenseVoice loads in-process, so this is a missing model or a missing
+        # wheel; whisper is a separate service, so it is one that never came
+        # up. Both have already logged the specific reason.
+        log.error("stt backend %r is not usable — see the error above",
+                  cfg.stt.backend)
         return 1
+    log.info("stt ready: %s", stt.name)
 
     speaker = Speaker(cfg.tts)
     speaker.warm()
@@ -275,7 +281,7 @@ def main() -> int:
         # settings page has to report the capsule the open stream is actually
         # reading from, and before `Microphone` exists the honest answer is
         # "not open".
-        info=SystemInfo(cfg, speaker=speaker, started=started),
+        info=SystemInfo(cfg, speaker=speaker, stt=stt, started=started),
         state=lambda: machine.state.value,
         retention_hours=cfg.retention.hours,
     )
@@ -352,8 +358,14 @@ def main() -> int:
                     result = stt.listen(audio)
                     turn.mark("stt")
 
-                    # The blank-audio marker is cleared in stt/engine.py, which is
-                    # the only place that knows it is a whisper.cpp artefact.
+                    # Empty here means "nothing usable was said" and nothing
+                    # else. Every backend-specific marker for that —
+                    # whisper.cpp's "[BLANK_AUDIO]", a clip too short to have
+                    # a phoneme in it — is cleared inside the backend, which is
+                    # the only place that knows what its own artefacts look
+                    # like. Callers used to strip them here, which was too late:
+                    # "[BLANK_AUDIO]" is ten Latin letters, so a silent
+                    # Mandarin turn got answered in English.
                     text = result.text.strip()
 
                     if not text:
@@ -463,8 +475,7 @@ def main() -> int:
                 except Exception:
                     log.exception("turn failed")
                     machine.to(State.ERROR)
-                    # Say so. A turn that dies here — whisper-server wedged or
-                    # restarting is the realistic cause — used to end in silence:
+                    # Say so. A turn that dies here used to end in silence:
                     # the wake word was acknowledged, the music ducked, "Listening…"
                     # stayed on screen, and then nothing ever came back. From the
                     # outside that is indistinguishable from the assistant having
@@ -500,6 +511,11 @@ def main() -> int:
 
     finally:
         detector.close()
+        # Holds an ONNX graph on the SenseVoice backend, and an HTTP session
+        # on the whisper one. Neither survives the process, but this list is
+        # the project's record of what owns a real resource and it should stay
+        # complete.
+        stt.close()
         speaker.close()
         panel.close()
         web.stop()

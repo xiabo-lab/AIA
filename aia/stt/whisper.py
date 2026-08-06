@@ -1,5 +1,11 @@
 """Speech to text, against a resident whisper.cpp server.
 
+**This is the fallback backend.** SenseVoice is the default — see
+`aia/stt/sensevoice.py`. Whisper is kept because it is the only transcriber on
+this device with a measured accuracy record on real captures from this room,
+and because a comparison needs both halves present. Set `stt.backend` to
+`"whisper"`, or `AIA_STT_BACKEND=whisper`, to run it.
+
 Why a server rather than shelling out to whisper-cli per utterance: the model
 has to stay in memory. Loading `ggml-base` costs ~96 ms and Piper's voice up to
 1190 ms — paying either on the critical path blows the budget. The server also
@@ -72,6 +78,11 @@ to avoid paying it, all rejected on measurement:
 
 `verbose_json` is a separate ~390 ms on top, for DTW word alignment. It is off
 unless someone asks for confidence.
+
+**Cantonese was never in scope for this backend and is the reason there is a
+second one.** Stock Whisper is unusable on it at ~49.5% CER — it does not fail
+loudly, it produces confident Mandarin-ish text — so the `small`-vs-latency
+trade above was never the whole problem.
 """
 
 from __future__ import annotations
@@ -85,6 +96,7 @@ import numpy as np
 import requests
 
 from aia.core.config import SttConfig
+from aia.stt.base import SttBackend, Transcript, detect_script
 
 log = logging.getLogger(__name__)
 
@@ -100,33 +112,12 @@ def _wav_bytes(audio: np.ndarray, rate: int) -> bytes:
     return buf.getvalue()
 
 
-class Transcript:
-    __slots__ = ("text", "language", "ms", "confidence")
-
-    def __init__(self, text: str, language: str, ms: float, confidence: float | None = None):
-        self.text = text
-        self.language = language
-        self.ms = ms
-        # Mean per-word probability, or None when running in the fast `json`
-        # mode that does not compute word timings. The spec asks STT to return
-        # a confidence score; set SttConfig.verbose to get one, and read the
-        # module docstring for what it costs.
-        self.confidence = confidence
-
-    def __bool__(self) -> bool:
-        return bool(self.text.strip())
-
-    def __repr__(self) -> str:
-        conf = "-" if self.confidence is None else f"{self.confidence:.2f}"
-        return f"<Transcript {self.language} {self.ms:.0f}ms conf={conf} {self.text!r}>"
-
-
 # Whisper reports languages by English name in verbose_json ("chinese"), but
 # everything else here uses ISO-ish short codes.
 _LANG_NAMES = {"english": "en", "chinese": "zh"}
 
 
-class SpeechToText:
+class WhisperSTT(SttBackend):
     """Transcription, detecting the spoken language on every utterance.
 
     Nothing is remembered between turns. A command in English followed by one
@@ -138,6 +129,8 @@ class SpeechToText:
     The exception is a caller that genuinely knows the language, which is
     `listen(..., language=...)` — see there.
     """
+
+    name = "whisper.cpp (whisper-server)"
 
     def __init__(self, cfg: SttConfig, rate: int):
         # `rate` is required, not defaulted. It was `= 16000` and both call
@@ -171,27 +164,43 @@ class SpeechToText:
         question. Neither is a yes, so a shutdown the user had authorised was
         silently cancelled. Naming it is also ~600 ms cheaper.
         """
-        wav = _wav_bytes(audio, self.rate)
-        result = self._transcribe(wav, language or self._detect_with())
+        # An utterance the transcriber cannot do anything with is not an error
+        # to propagate — the assistant apologises and keeps listening. Doing
+        # this here rather than in the caller means both backends behave the
+        # same way when the endpointer hands over a click or a breath.
+        if audio is None or len(audio) == 0:
+            return Transcript("", self.cfg.default_language, 0.0)
 
-        # Decoded into a language this assistant does not support. Redo it in
-        # a supported one rather than handing the router text it can never
-        # match. This fired on audio captured through the broken decimator and
-        # has not fired since; it is kept as a net, not as a working part of
-        # the path.
-        #
-        # Retry in the language the CALLER named, if it named one. It used to
-        # retry as "zh" unconditionally, which threw away the one thing more
-        # reliable than any detector — and the only caller that names a
-        # language is the confirmation, deciding whether an irreversible action
-        # goes ahead. An English "yes" would have been re-decoded as Mandarin.
-        # With nothing named, Chinese is still the right second guess: the CJK
-        # neighbours are what Whisper reaches for on Mandarin.
-        if detect_script(result.text) == "other":
-            retry_in = language or "zh"
-            log.info("transcript %r is not a supported language; retrying as %r",
-                     result.text[:20], retry_in)
-            result = self._transcribe(wav, retry_in)
+        try:
+            wav = _wav_bytes(audio, self.rate)
+            result = self._transcribe(wav, language or self._detect_with())
+
+            # Decoded into a language this assistant does not support. Redo it
+            # in a supported one rather than handing the router text it can
+            # never match. This fired on audio captured through the broken
+            # decimator and has not fired since; it is kept as a net, not as a
+            # working part of the path.
+            #
+            # Retry in the language the CALLER named, if it named one. It used
+            # to retry as "zh" unconditionally, which threw away the one thing
+            # more reliable than any detector — and the only caller that names
+            # a language is the confirmation, deciding whether an irreversible
+            # action goes ahead. An English "yes" would have been re-decoded as
+            # Mandarin. With nothing named, Chinese is still the right second
+            # guess: the CJK neighbours are what Whisper reaches for on
+            # Mandarin.
+            if detect_script(result.text) == "other":
+                retry_in = language or "zh"
+                log.info("transcript %r is not a supported language; retrying as %r",
+                         result.text[:20], retry_in)
+                result = self._transcribe(wav, retry_in)
+        except Exception:
+            # whisper-server wedged, restarting, or gone. One dead turn, an
+            # apology, and the next wake word gets a fresh attempt — which is
+            # a great deal better than the assistant exiting because a
+            # subprocess it does not own fell over.
+            log.exception("whisper transcription failed")
+            return Transcript("", self.cfg.default_language, 0.0)
 
         # The script of what came back is a better answer than what was asked
         # for: `auto` reports nothing in the fast `json` mode, and a
@@ -251,7 +260,11 @@ class SpeechToText:
             ]
             confidence = sum(probs) / len(probs) if probs else None
 
-        result = Transcript(text, lang, ms, confidence)
+        # `detected` is left as whatever Whisper reported, which is usually
+        # nothing at all in the fast `json` mode. It cannot distinguish
+        # Cantonese from Mandarin in any case — that is what the other backend
+        # is for — so claiming a value here would be an invention.
+        result = Transcript(text, lang, ms, confidence, detected=reported)
         log.info("stt %s", result)
         return result
 
@@ -272,46 +285,16 @@ class SpeechToText:
                 time.sleep(0.5)
         return False
 
+    def close(self) -> None:
+        self._session.close()
 
-# Scripts that mean the language was detected wrongly. Whisper's automatic
-# detection ranges over all 99 languages it knows, and on Mandarin speech it
-# reaches for its CJK neighbours often enough to matter — real examples from
-# this device: 총치 (Korean), よいしょ and じゃあ (Japanese). None of that can
-# route, and none of it is a language this assistant supports.
-_FOREIGN_RANGES = (
-    ("぀", "ヿ"),  # hiragana + katakana
-    ("가", "힯"),  # hangul syllables
-    ("ᄀ", "ᇿ"),  # hangul jamo
-    ("Ѐ", "ӿ"),  # cyrillic
-    ("฀", "๿"),  # thai
-    ("؀", "ۿ"),  # arabic
-    ("ऀ", "ॿ"),  # devanagari
-)
-
-
-def detect_script(text: str) -> str | None:
-    """Classify a transcript as `en`, `zh`, or `other`.
-
-    `other` means Whisper decoded in a language this assistant does not
-    support — the caller re-runs the pass with an explicit language rather
-    than handing the router text it can never match.
-
-    Note a code-switched command like "Play 周杰伦" resolves to `en`: the
-    carrier sentence is English and only the proper noun is not, so an English
-    reply is the right one.
-
-    Japanese written purely in kanji is indistinguishable from Chinese here,
-    and deliberately so — it is Han either way, and the router matches by
-    pinyin, so treating it as Chinese loses nothing.
-    """
-    if not text:
-        return None
-    if any(low <= ch <= high for ch in text for low, high in _FOREIGN_RANGES):
-        return "other"
-    han = sum(1 for ch in text if "一" <= ch <= "鿿")
-    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
-    if han and han >= latin:
-        return "zh"
-    if latin:
-        return "en"
-    return None
+    def describe(self) -> dict:
+        return {
+            "engine": self.name,
+            "url": self.cfg.url,
+            # The setting the whole latency budget rests on, and the one most
+            # likely to be quietly different from what someone assumes.
+            "audio_ctx": self.cfg.audio_ctx,
+            "readable_audio_ms": self.cfg.readable_audio_ms,
+            "timeout_s": self.cfg.timeout_s,
+        }
