@@ -240,15 +240,73 @@ The script waits for the server before opening, so pressing it at boot lands on
 the UI rather than on Chromium's "site can't be reached" — which an `--app`
 window has no address bar to get off. Its other flags are commented in place.
 
+**Maximising is the compositor's job, not Chromium's.** `--start-maximized` is
+honoured on a fresh profile and ignored once Chromium has saved window bounds,
+so the same command opens maximised one day and in a 945x430 box the next. A
+labwc window rule is deterministic. In `~/.config/labwc/rc.xml`:
+
+```xml
+<windowRules>
+  <windowRule identifier="aia-ui"><action name="Maximize"/></windowRule>
+</windowRules>
+```
+
+`aia-ui` is the `--class` the launcher passes, and the same string
+`aia-ui.desktop` uses as `StartupWMClass` so the taskbar groups the window
+under the AIA icon.
+
+To put it one tap away when Kodama-Lite is covering the desktop, add it to the
+panel's launchers in `~/.config/wf-panel-pi/wf-panel-pi.ini` — the entry is the
+`.desktop` basename, and the file must be in `~/.local/share/applications`:
+
+```ini
+launchers=x-www-browser pcmanfm x-terminal-emulator aia-ui
+```
+
+### Two things about this compositor that cost an evening
+
+**labwc here binds no way to close or un-fullscreen a window.** Stock
+`rc.xml` gives you Maximize, UnMaximize, volume and magnify — there is no
+Alt+F4 and no fullscreen toggle. So a full-screen app with no titlebar is
+unrecoverable on a touch-only display. Worth adding:
+
+```xml
+<keyboard>
+  <keybind key="A-F11"><action name="ToggleFullscreen"/></keybind>
+  <keybind key="A-F4"><action name="Close"/></keybind>
+</keyboard>
+```
+
+**The panel loses its surface when labwc reloads its config, and does not draw
+again until it is restarted.** `pkill wf-panel-pi` is enough — `lwrespawn` in
+labwc's autostart brings it straight back. Reload labwc with `kill -HUP` on its
+pid; `labwc --reconfigure` exits with "LABWC_PID not set" from a plain ssh
+session and silently changes nothing, which makes an edit look like it had no
+effect when it was simply never loaded.
+
+That pair is worth knowing together, because a full-screen window covering the
+panel and a panel that has not been restarted look identical from a screenshot
+— and Kodama-Lite in full-screen (its own toolbar toggle, top centre) covers
+the taskbar exactly the way a broken panel does.
+
 ### The taskbar must stay at the top
 
 `position=bottom` in `~/.config/wf-panel-pi/wf-panel-pi.ini` does not work on
 this Pi — wf-panel-pi 1.13 with labwc 0.9.8. The panel process starts and stays
-running, but nothing is ever drawn and no exclusive zone is reserved, so a
-maximised window takes the full height and the taskbar is simply gone. Verified
-by screenshot in both positions, and it is not the `monitor=` key, not the
-partial config the panel's own preferences dialog writes, and not autohide:
-`top` maps instantly, `bottom` never does.
+running, but nothing is drawn and **no exclusive zone is reserved**, so a
+maximised window takes the full height.
+
+That second half is what makes it a real finding rather than a misreading,
+because a panel covered by a full-screen window looks exactly the same in a
+screenshot. Under `top` the maximised player sat at y=28 and the panel drew;
+under `bottom` the player took all 440 px. Tested four ways, each with the panel
+restarted afterwards: the config the preferences dialog writes, the same without
+`monitor=`, the full `/etc/xdg` default, and with `autohide=false`. `top` maps
+instantly every time; `bottom` never does.
+
+Before blaming the panel, though, check the other cause first: **Kodama-Lite in
+full-screen covers the taskbar**, and its toggle is the icon at top centre of
+its own toolbar. `Alt+F11` (once bound, see above) gets out of it.
 
 ### 24 hours, and the one exception
 
