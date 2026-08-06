@@ -6,10 +6,15 @@ GenericName=Voice assistant
 Comment=Conversation history and system information for AIA
 # $HOME is expanded by sh at launch, so this entry needs no per-user editing —
 # copy it to ~/Desktop and to ~/.local/share/applications as it is.
-Exec=/bin/sh -c "$HOME/AI_Assit/scripts/aia-ui.sh"
+#
+# The backslash is required, not decoration: the Desktop Entry spec reserves $
+# inside a quoted argument and desktop-file-validate rejects it unescaped. The
+# launcher strips the backslash, so sh still receives "$HOME/..." and expands
+# it. Check with `desktop-file-validate` after editing this line.
+Exec=/bin/sh -c "\$HOME/AI_Assit/scripts/aia-ui.sh"
 Icon=audio-input-microphone
 Terminal=false
-Categories=Utility;AudioVideo;
+Categories=Utility;
 # Matches --class=aia-ui in aia-ui.sh, so the taskbar groups the window under
 # this entry and its icon rather than under Chromium's.
 StartupWMClass=aia-ui
