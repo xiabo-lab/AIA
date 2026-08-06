@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import time
 from pathlib import Path
 from typing import Iterator
@@ -68,26 +69,126 @@ RESTART_BACKOFF_S = 1.0
 MAX_RESTART_BACKOFF_S = 30.0
 
 
-def find_input_device(match: str) -> int:
+_CARD_LINE = re.compile(r"^\s*(\d+)\s*\[([^\]]*)\]\s*:\s*(.*)$", re.M)
+_HW_RE = re.compile(r"\(hw:(\d+),\d+\)")
+
+
+def _live_cards() -> dict[int, str]:
+    """ALSA card index -> description, read fresh from /proc/asound/cards.
+
+    Deliberately never cached. This is the only view of the sound cards that is
+    guaranteed to reflect a re-plug, which is what makes it the thing to check
+    PortAudio's own list against. Empty anywhere without /proc/asound, and
+    every caller treats "empty" as "cannot tell" rather than "no cards".
+    """
+    try:
+        text = Path("/proc/asound/cards").read_text()
+    except OSError:
+        return {}
+    return {int(m.group(1)): f"{m.group(2).strip()} — {m.group(3).strip()}"
+            for m in _CARD_LINE.finditer(text)}
+
+
+def _hw_card(name: str) -> int | None:
+    """The ALSA card number PortAudio baked into a device name, if it has one.
+
+    Names look like "USB PnP Sound Device: Audio (hw:3,0)". That number is a
+    snapshot from enumeration time, not a live fact — comparing it against
+    `_live_cards` is exactly how staleness is detected.
+    """
+    m = _HW_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _matching_inputs(match: str) -> list[tuple[int, dict]]:
+    return [(idx, dev) for idx, dev in enumerate(sd.query_devices())
+            if dev["max_input_channels"] > 0 and match in dev["name"]]
+
+
+def _stale(matches: list[tuple[int, dict]]) -> bool:
+    """Does PortAudio's device list disagree with the kernel's?
+
+    Two ways it can, both seen on this Pi: a match naming a card that no longer
+    exists (the mic was re-plugged and renumbered), or no match at all because
+    the list predates the microphone being plugged in. Both leave the assistant
+    retrying forever against a list that cannot come true.
+    """
+    live = _live_cards()
+    if not live:
+        return False
+    if not matches:
+        return True
+    return any(_hw_card(dev["name"]) not in live for _, dev in matches)
+
+
+def _refresh_portaudio() -> bool:
+    """Rebuild PortAudio's cached device list. Says whether it worked.
+
+    **Only safe where this process holds no open stream.** `_terminate()` tears
+    down every stream PortAudio owns, input and output alike. `tts/piper.py`
+    documents the reverse mistake in detail: refreshing to recover *output*
+    destroyed the microphone, so the wake word fired exactly once per run.
+
+    Called from one place, `_restart()`, after the dead input stream has been
+    closed. A reply being spoken at that instant is the cost, and it is the
+    same trade piper.py already reasoned through, pointing the other way: a
+    lost sentence against an assistant that cannot hear again until someone
+    restarts it.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception:
+        log.warning("could not rebuild PortAudio's device list", exc_info=True)
+        return False
+
+
+def find_input_device(match: str, allow_refresh: bool = False) -> int:
     """Index of the first input device whose name contains `match`.
 
     Matching on name rather than a fixed index because the ALSA card number
     moves when other USB audio is present — the mic came up as hw:2,0 here,
     but that is not stable across reboots or re-plugging.
+
+    `allow_refresh` permits rebuilding PortAudio's device list when this one is
+    provably stale. It is only safe where no input stream is open; see
+    `_refresh_portaudio`.
     """
-    matches = [(idx, dev) for idx, dev in enumerate(sd.query_devices())
-               if dev["max_input_channels"] > 0 and match in dev["name"]]
+    matches = _matching_inputs(match)
+
+    # PortAudio enumerates once per process, so an index outlives the card
+    # layout that produced it. After a re-plug the same index can point at a
+    # different capsule — or at nothing. Measured here: the list still said
+    # "USB PnP Sound Device: Audio (hw:2,0)" long after that card became
+    # hw:3,0, so every reopen attempt asked ALSA for a card index 2 that no
+    # longer existed ("Cannot get card index for 2") and the assistant stayed
+    # deaf in a retry loop while a working microphone sat unused at hw:3,0.
+    if allow_refresh and _stale(matches):
+        log.warning(
+            "PortAudio's device list disagrees with the kernel — it offers %s "
+            "for %r, live cards are %s; rebuilding it",
+            [d["name"].strip() for _, d in matches] or "nothing",
+            match, sorted(_live_cards()),
+        )
+        if _refresh_portaudio():
+            matches = _matching_inputs(match)
 
     if matches:
         idx, dev = matches[0]
         # Say so when there was a choice. Two USB microphones enumerate with
-        # the *same* name here — "USB PnP Sound Device: Audio (hw:2,0)" and
-        # "(hw:3,0)" — differing only by a card number that moves on reboot
-        # and re-plug. Taking the first is as good a rule as any, but doing it
+        # names that differ only by a card number that moves on reboot and
+        # re-plug. Taking the first is as good a rule as any, but doing it
         # silently is what turned swapping a microphone into a long hunt: the
         # capture came from a different capsule with ~10 dB more gain, every
         # log line looked normal, and the only symptom was every utterance
         # running to the endpointer's cap.
+        #
+        # Still a warning rather than fatal. A wrong pick used to be
+        # undetectable downstream, which is what argued for refusing to start;
+        # now the resolved ALSA card is in the line below and can be checked
+        # against /proc/asound. An appliance that has to recover unattended is
+        # better off deaf-and-guessing than deaf-and-refusing.
         if len(matches) > 1:
             log.warning(
                 "%d input devices match %r; using [%d] %s. The others are %s — "
@@ -96,7 +197,11 @@ def find_input_device(match: str) -> int:
                 len(matches), match, idx, dev["name"].strip(),
                 [d["name"].strip() for _, d in matches[1:]],
             )
-        log.info("microphone: [%d] %s", idx, dev["name"].strip())
+        card = _hw_card(dev["name"])
+        log.info("microphone: [%d] %s (ALSA card %s: %s)", idx,
+                 dev["name"].strip(),
+                 "?" if card is None else card,
+                 _live_cards().get(card, "not in /proc/asound — list is stale"))
         return idx
 
     # Not found is two different faults wearing the same face, and by far the
@@ -125,11 +230,7 @@ def _card_present(match: str) -> bool:
     Linux-only and best-effort — anywhere without /proc/asound this simply says
     no and the caller falls back to the generic message.
     """
-    try:
-        cards = Path("/proc/asound/cards").read_text()
-    except OSError:
-        return False
-    return match.lower() in cards.lower()
+    return any(match.lower() in desc.lower() for desc in _live_cards().values())
 
 
 class Microphone:
@@ -386,7 +487,11 @@ class Microphone:
             log.debug("closing the dead stream failed", exc_info=True)
         self._stream = None
         try:
-            self.device = find_input_device(self.cfg.device_match)
+            # Refresh is allowed here and nowhere else: the dead input stream
+            # was just closed above, so there is none for `_terminate()` to
+            # destroy. This is the path that could not recover a re-plug.
+            self.device = find_input_device(self.cfg.device_match,
+                                            allow_refresh=True)
             self.__enter__()
             self._reset_resampler()
             if self._restart_failures:

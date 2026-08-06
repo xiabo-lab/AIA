@@ -33,10 +33,19 @@ class AudioConfig:
     # after a weekend, bounded so it cannot grow to a gigabyte of SD card.
     keep_utterances: int = 200
 
-    # Substring matched against the portaudio device name. The USB mic
-    # enumerates as "USB PnP Sound Device: Audio (hw:2,0)", but the card
-    # number moves when other USB audio is plugged in, so match on name.
-    device_match: str = "USB"
+    # Substring matched against the portaudio device name. The card number
+    # moves when other USB audio is plugged in, so match on name — but match
+    # on a name that identifies *one* capsule. A bare "USB" matched both mics
+    # on this Pi and the pick fell to enumeration order, which is how capture
+    # ended up on a different microphone than the log named. The two here:
+    #
+    #   "USB PnP Sound Device"  TI PCM2902,   mixer range 0-16 (23.81 dB max)
+    #   "USB Microphone"        Generalplus,  mixer range 0-30 (33.00 dB max)
+    #
+    # Switching microphones is a one-line change here. Whichever is named, the
+    # resolved ALSA card is logged at startup — check it against /proc/asound
+    # rather than trusting this string to have meant what you thought.
+    device_match: str = "USB PnP Sound Device"
 
     # 30 ms at 16 kHz = 480 samples. webrtcvad accepts only 10/20/30 ms
     # frames, and 30 ms is the cheapest of the three.
