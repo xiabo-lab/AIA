@@ -11,15 +11,16 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import subprocess
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, sosfilt, sosfilt_zi
 
-from aia.core.config import AudioConfig
+from aia.core.config import AudioConfig, MicProfile
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +106,21 @@ def _matching_inputs(match: str) -> list[tuple[int, dict]]:
             if dev["max_input_channels"] > 0 and match in dev["name"]]
 
 
-def _stale(matches: list[tuple[int, dict]]) -> bool:
+def _candidates(profiles: Sequence[MicProfile]) -> list[tuple[int, dict, MicProfile]]:
+    """Every plugged-in device matching any known profile, best first.
+
+    Profiles are walked in order and their matches appended in that order, so
+    the head of this list is the most preferred microphone that is actually
+    present. That is the whole of the auto-detection: swap one known capsule
+    for another and the next open finds it, with its own settings.
+    """
+    out: list[tuple[int, dict, MicProfile]] = []
+    for prof in profiles:
+        out.extend((idx, dev, prof) for idx, dev in _matching_inputs(prof.match))
+    return out
+
+
+def _stale(candidates: list[tuple[int, dict, MicProfile]]) -> bool:
     """Does PortAudio's device list disagree with the kernel's?
 
     Two ways it can, both seen on this Pi: a match naming a card that no longer
@@ -116,9 +131,59 @@ def _stale(matches: list[tuple[int, dict]]) -> bool:
     live = _live_cards()
     if not live:
         return False
-    if not matches:
+    if not candidates:
         return True
-    return any(_hw_card(dev["name"]) not in live for _, dev in matches)
+    return any(_hw_card(dev["name"]) not in live for _, dev, _p in candidates)
+
+
+def _mixer_state(card: int) -> str:
+    """What the `Mic` control actually reads back, for the log line.
+
+    Applying a setting and reporting the setting you *asked for* is how a
+    microphone ends up documented at a gain it is not at. Read it back.
+    """
+    try:
+        r = subprocess.run(["amixer", "-c", str(card), "sget", "Mic"],
+                           capture_output=True, timeout=5, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return "unreadable"
+    m = re.search(r"Capture (\d+) \[\d+%\] \[(-?[\d.]+dB)\]", r.stdout)
+    return f"{m.group(1)} ({m.group(2)})" if m else "unreadable"
+
+
+def _apply_profile(prof: MicProfile, card: int | None) -> None:
+    """Put the microphone's mixer into the state it was measured in.
+
+    Applied on every open, re-plugs included, because that is the point of a
+    profile: ALSA's stored state is keyed per card and holds only what
+    `alsactl store` last captured, so a capsule the system has never seen has
+    no entry at all. This one arrived at 30/30 — 33.00 dB, deep into the range
+    where proximity to full scale drives voiced% to 100% and the endpointer can
+    never terminate.
+
+    Best-effort throughout. A microphone that does not expose these controls,
+    or a host without amixer, is not a reason to refuse to listen — it is a
+    reason to say so once and carry on with whatever the mixer already had.
+    """
+    if card is None:
+        return
+    wanted = [("Mic", None if prof.gain is None else str(prof.gain))]
+    if prof.agc is not None:
+        wanted.append(("Auto Gain Control", "on" if prof.agc else "off"))
+
+    for control, value in wanted:
+        if value is None:
+            continue
+        try:
+            r = subprocess.run(
+                ["amixer", "-c", str(card), "-q", "sset", control, value],
+                capture_output=True, timeout=5, text=True)
+            if r.returncode != 0:
+                log.warning("could not set %r to %s on card %d: %s", control,
+                            value, card,
+                            r.stderr.strip() or f"amixer exited {r.returncode}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("could not set %r on card %d: %s", control, card, exc)
 
 
 def _refresh_portaudio() -> bool:
@@ -144,9 +209,9 @@ def _refresh_portaudio() -> bool:
         return False
 
 
-def find_input_device(match: str, allow_refresh: bool = False,
-                      quiet: bool = False) -> int:
-    """Index of the first input device whose name contains `match`.
+def find_input_device(profiles: Sequence[MicProfile], allow_refresh: bool = False,
+                      quiet: bool = False) -> tuple[int, MicProfile]:
+    """Index and profile of the most preferred microphone that is plugged in.
 
     Matching on name rather than a fixed index because the ALSA card number
     moves when other USB audio is present — the mic came up as hw:2,0 here,
@@ -158,7 +223,7 @@ def find_input_device(match: str, allow_refresh: bool = False,
     retry loop where it would otherwise repeat for as long as the microphone
     stays unplugged.
     """
-    matches = _matching_inputs(match)
+    found = _candidates(profiles)
 
     # PortAudio enumerates once per process, so an index outlives the card
     # layout that produced it. After a re-plug the same index can point at a
@@ -167,22 +232,22 @@ def find_input_device(match: str, allow_refresh: bool = False,
     # hw:3,0, so every reopen attempt asked ALSA for a card index 2 that no
     # longer existed ("Cannot get card index for 2") and the assistant stayed
     # deaf in a retry loop while a working microphone sat unused at hw:3,0.
-    if allow_refresh and _stale(matches):
+    if allow_refresh and _stale(found):
         log.log(
             logging.DEBUG if quiet else logging.WARNING,
             "PortAudio's device list disagrees with the kernel — it offers %s "
-            "for %r, live cards are %s; rebuilding it",
-            [d["name"].strip() for _, d in matches] or "nothing",
-            match, sorted(_live_cards()),
+            "for %s, live cards are %s; rebuilding it",
+            [d["name"].strip() for _, d, _p in found] or "nothing",
+            [p.match for p in profiles], sorted(_live_cards()),
         )
         if _refresh_portaudio():
-            matches = _matching_inputs(match)
+            found = _candidates(profiles)
 
-    if matches:
-        idx, dev = matches[0]
+    if found:
+        idx, dev, prof = found[0]
         # Say so when there was a choice. Two USB microphones enumerate with
         # names that differ only by a card number that moves on reboot and
-        # re-plug. Taking the first is as good a rule as any, but doing it
+        # re-plug. Preference order is as good a rule as any, but applying it
         # silently is what turned swapping a microphone into a long hunt: the
         # capture came from a different capsule with ~10 dB more gain, every
         # log line looked normal, and the only symptom was every utterance
@@ -193,20 +258,22 @@ def find_input_device(match: str, allow_refresh: bool = False,
         # now the resolved ALSA card is in the line below and can be checked
         # against /proc/asound. An appliance that has to recover unattended is
         # better off deaf-and-guessing than deaf-and-refusing.
-        if len(matches) > 1:
+        if len(found) > 1:
             log.warning(
-                "%d input devices match %r; using [%d] %s. The others are %s — "
-                "if that is the wrong one, unplug it or make device_match "
-                "more specific.",
-                len(matches), match, idx, dev["name"].strip(),
-                [d["name"].strip() for _, d in matches[1:]],
+                "%d microphones are plugged in; using %s. The others are %s — "
+                "reorder AudioConfig.microphones if that is the wrong one.",
+                len(found), dev["name"].strip(),
+                [d["name"].strip() for _, d, _p in found[1:]],
             )
         card = _hw_card(dev["name"])
-        log.info("microphone: [%d] %s (ALSA card %s: %s)", idx,
-                 dev["name"].strip(),
+        _apply_profile(prof, card)
+        log.info("microphone: [%d] %s (ALSA card %s: %s) — %s, gain now %s",
+                 idx, dev["name"].strip(),
                  "?" if card is None else card,
-                 _live_cards().get(card, "not in /proc/asound — list is stale"))
-        return idx
+                 _live_cards().get(card, "not in /proc/asound — list is stale"),
+                 prof.note or prof.match,
+                 "?" if card is None else _mixer_state(card))
+        return idx, prof
 
     # Not found is two different faults wearing the same face, and by far the
     # likelier one is that the device is fine and somebody else has it: ALSA
@@ -216,14 +283,15 @@ def find_input_device(match: str, allow_refresh: bool = False,
     # card number, when the answer is `systemctl --user stop aia`. The card
     # stays listed in /proc/asound whether or not it is open, which is what
     # tells the two apart.
-    if _card_present(match):
+    busy = [p.match for p in profiles if _card_present(p.match)]
+    if busy:
         raise RuntimeError(
-            f"the microphone matching {match!r} exists but could not be opened — "
+            f"the microphone matching {busy[0]!r} exists but could not be opened — "
             "it is almost certainly already in use. The device allows one "
             "reader, and AIA is usually it: `systemctl --user stop aia`."
         )
     raise RuntimeError(
-        f"no input device matching {match!r}; "
+        f"no input device matching any of {[p.match for p in profiles]}; "
         f"available: {[d['name'] for d in sd.query_devices() if d['max_input_channels'] > 0]}"
     )
 
@@ -309,7 +377,7 @@ class Microphone:
 
     def __init__(self, cfg: AudioConfig):
         self.cfg = cfg
-        self.device = find_input_device(cfg.device_match)
+        self.device, self.profile = find_input_device(cfg.microphones)
 
         # Holds capture-rate audio; the consumer downsamples. Bounding this by a
         # count of *blocks* bounds it by nothing useful, because the device does
@@ -503,9 +571,11 @@ class Microphone:
             # microphone that is gone is usually gone for minutes, so first
             # attempt and then occasionally is enough to catch it returning.
             refresh = first or self._restart_failures % 8 == 0
-            self.device = find_input_device(self.cfg.device_match,
-                                            allow_refresh=refresh,
-                                            quiet=not first)
+            # Re-selects rather than reopening the same index, so unplugging one
+            # known microphone and plugging in another is recovered from here,
+            # with the new capsule's own mixer settings applied.
+            self.device, self.profile = find_input_device(
+                self.cfg.microphones, allow_refresh=refresh, quiet=not first)
             self.__enter__()
             self._reset_resampler()
             if self._restart_failures:

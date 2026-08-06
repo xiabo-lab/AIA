@@ -17,6 +17,29 @@ VENDOR = ROOT / "vendor"
 
 
 @dataclass(frozen=True)
+class MicProfile:
+    """A known microphone, and the mixer state it was measured in.
+
+    `match` is a substring of the PortAudio device name. It has to be specific
+    enough to identify *one* capsule: a bare "USB" matched both microphones on
+    this Pi and the pick fell to enumeration order, which is how capture once
+    ran on a different capsule than the log named.
+
+    `gain` is a step on that device's own `Mic` scale, not a dB figure. The
+    scales differ — 0-30 on one of these, 0-16 on the other — and only the step
+    is portable to amixer, so the dB it lands on is in the comment beside each
+    profile. That is the number worth comparing between microphones.
+
+    `None` for `gain` or `agc` leaves that control alone.
+    """
+
+    match: str
+    gain: int | None = None
+    agc: bool | None = None
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class AudioConfig:
     # The USB PnP sound device (TI PCM2902) refuses 16 kHz outright —
     # portaudio returns paInvalidSampleRate. It offers only 44100 and 48000,
@@ -33,34 +56,44 @@ class AudioConfig:
     # after a weekend, bounded so it cannot grow to a gigabyte of SD card.
     keep_utterances: int = 200
 
-    # Substring matched against the portaudio device name. The card number
-    # moves when other USB audio is plugged in, so match on name — but match
-    # on a name that identifies *one* capsule. A bare "USB" matched both mics
-    # on this Pi and the pick fell to enumeration order, which is how capture
-    # ended up on a different microphone than the log named. The two here:
+    # Known microphones, in preference order: the first one actually plugged in
+    # is used, and its mixer settings are applied on every open. Unplug one and
+    # plug in the other and nothing here needs editing.
     #
-    #   "USB PnP Sound Device"  TI PCM2902,   mixer range 0-16 (23.81 dB max)
-    #   "USB Microphone"        Generalplus,  mixer range 0-30 (33.00 dB max)
+    # Applying the gain from here rather than leaving it to ALSA's stored state
+    # is deliberate. `/var/lib/alsa/asound.state` is keyed per card and only
+    # holds what `alsactl store` last captured, so a microphone the system has
+    # never seen has no entry at all — the Generalplus arrived at 30/30
+    # (33.00 dB), which is deep into the range where proximity to full scale
+    # drives voiced% to 100% and the endpointer can never terminate. A stored
+    # entry can also go stale against the tuning it was meant to hold: the TI's
+    # said 16 (23.81 dB) long after this project settled on 8.
     #
-    # Switching microphones is a one-line change here. Whichever is named, the
-    # resolved ALSA card is logged at startup — check it against /proc/asound
-    # rather than trusting this string to have meant what you thought.
-    #
-    # On the Generalplus since 2026-08-05. A paired A/B — both mics recording
-    # the same utterances at matched gain — could not separate them: 13/13 wake
-    # detections each, identical transcripts. It is chosen for its coverage
-    # claims (omnidirectional, further field), which that close-range test did
-    # not exercise, not because it measured better.
-    #
-    # Two things about it that the TI did not have. It has a DC offset of ~305
-    # LSB (0.93% of full scale) and sub-100 Hz content, and there is no
-    # high-pass anywhere in this pipeline — only the anti-alias lowpass — so
-    # that reaches webrtcvad and Whisper and inflates any threshold compared
-    # against wideband RMS. And it advertises internal noise reduction, which
-    # is level-dependent processing of exactly the kind AGC was: see the gain
-    # incident where a capsule near full scale drove voiced% to 100% and the
-    # endpointer could never terminate.
-    device_match: str = "USB Microphone"
+    # Both gains below are the level-matched pair from the 2026-08-05 A/B,
+    # which is why they land within 0.1 dB of each other.
+    microphones: tuple[MicProfile, ...] = (
+        # Generalplus, omnidirectional condenser. In use since 2026-08-05, and
+        # chosen for coverage rather than measured quality — a paired A/B at
+        # matched gain could not separate the two capsules (13/13 wake
+        # detections each, identical transcripts), and a 27-trial wake_test on
+        # this one scored 27/27 against the TI's 25/27, which is 2 trials and
+        # not a distinguishable difference.
+        #
+        # Two things to watch, neither yet measured in anger. It has a DC
+        # offset of ~305 LSB (0.93% of full scale) and sub-100 Hz content, and
+        # there is no high-pass anywhere in this pipeline — only the anti-alias
+        # lowpass — so that reaches webrtcvad and Whisper, and inflates any
+        # threshold compared against wideband RMS. And it advertises internal
+        # noise reduction, which is level-dependent processing of the same
+        # family as the AGC that caused the saturation incident.
+        MicProfile(match="USB Microphone", gain=16, agc=False,
+                   note="Generalplus, omnidirectional (16/30 = 12.00 dB)"),
+        # TI PCM2902. Every recognition threshold in this project was tuned
+        # against this capsule, so it stays as the fallback. 8/16 is the value
+        # the audio review settled on; 16/16 is what caused the clipping.
+        MicProfile(match="USB PnP Sound Device", gain=8, agc=False,
+                   note="TI PCM2902 (8/16 = 11.90 dB)"),
+    )
 
     # 30 ms at 16 kHz = 480 samples. webrtcvad accepts only 10/20/30 ms
     # frames, and 30 ms is the cheapest of the three.
