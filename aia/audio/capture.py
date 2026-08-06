@@ -144,7 +144,8 @@ def _refresh_portaudio() -> bool:
         return False
 
 
-def find_input_device(match: str, allow_refresh: bool = False) -> int:
+def find_input_device(match: str, allow_refresh: bool = False,
+                      quiet: bool = False) -> int:
     """Index of the first input device whose name contains `match`.
 
     Matching on name rather than a fixed index because the ALSA card number
@@ -153,7 +154,9 @@ def find_input_device(match: str, allow_refresh: bool = False) -> int:
 
     `allow_refresh` permits rebuilding PortAudio's device list when this one is
     provably stale. It is only safe where no input stream is open; see
-    `_refresh_portaudio`.
+    `_refresh_portaudio`. `quiet` drops the staleness report to DEBUG, for the
+    retry loop where it would otherwise repeat for as long as the microphone
+    stays unplugged.
     """
     matches = _matching_inputs(match)
 
@@ -165,7 +168,8 @@ def find_input_device(match: str, allow_refresh: bool = False) -> int:
     # longer existed ("Cannot get card index for 2") and the assistant stayed
     # deaf in a retry loop while a working microphone sat unused at hw:3,0.
     if allow_refresh and _stale(matches):
-        log.warning(
+        log.log(
+            logging.DEBUG if quiet else logging.WARNING,
             "PortAudio's device list disagrees with the kernel — it offers %s "
             "for %r, live cards are %s; rebuilding it",
             [d["name"].strip() for _, d in matches] or "nothing",
@@ -490,8 +494,18 @@ class Microphone:
             # Refresh is allowed here and nowhere else: the dead input stream
             # was just closed above, so there is none for `_terminate()` to
             # destroy. This is the path that could not recover a re-plug.
+            #
+            # Not on every attempt, though. The list has to be rebuilt for a
+            # device that comes back under a new card number to be visible at
+            # all, but rebuilding it once per retry churns PortAudio for as
+            # long as the microphone stays unplugged — and piper.py explains
+            # what tearing PortAudio down does to anything still playing. A
+            # microphone that is gone is usually gone for minutes, so first
+            # attempt and then occasionally is enough to catch it returning.
+            refresh = first or self._restart_failures % 8 == 0
             self.device = find_input_device(self.cfg.device_match,
-                                            allow_refresh=True)
+                                            allow_refresh=refresh,
+                                            quiet=not first)
             self.__enter__()
             self._reset_resampler()
             if self._restart_failures:

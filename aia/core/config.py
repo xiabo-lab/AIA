@@ -45,7 +45,22 @@ class AudioConfig:
     # Switching microphones is a one-line change here. Whichever is named, the
     # resolved ALSA card is logged at startup — check it against /proc/asound
     # rather than trusting this string to have meant what you thought.
-    device_match: str = "USB PnP Sound Device"
+    #
+    # On the Generalplus since 2026-08-05. A paired A/B — both mics recording
+    # the same utterances at matched gain — could not separate them: 13/13 wake
+    # detections each, identical transcripts. It is chosen for its coverage
+    # claims (omnidirectional, further field), which that close-range test did
+    # not exercise, not because it measured better.
+    #
+    # Two things about it that the TI did not have. It has a DC offset of ~305
+    # LSB (0.93% of full scale) and sub-100 Hz content, and there is no
+    # high-pass anywhere in this pipeline — only the anti-alias lowpass — so
+    # that reaches webrtcvad and Whisper and inflates any threshold compared
+    # against wideband RMS. And it advertises internal noise reduction, which
+    # is level-dependent processing of exactly the kind AGC was: see the gain
+    # incident where a capsule near full scale drove voiced% to 100% and the
+    # endpointer could never terminate.
+    device_match: str = "USB Microphone"
 
     # 30 ms at 16 kHz = 480 samples. webrtcvad accepts only 10/20/30 ms
     # frames, and 30 ms is the cheapest of the three.
