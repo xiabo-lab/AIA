@@ -310,6 +310,27 @@ def record(only: str | None) -> int:
     return 0
 
 
+def load_directory(directory: Path) -> list[dict]:
+    """Every wav in a directory, with no reference text.
+
+    For `.bench/utterances/` — the assistant's own saved captures. Nobody wrote
+    down what was said in those, so accuracy is not available and is reported
+    as "-" rather than as a number that would be an invention. What they are
+    good for is everything that does not need a reference: latency, RTF, CPU
+    and RAM on real speech, in this room, through this microphone, at the
+    lengths people actually talk for.
+
+    That is worth having on its own. The `record` corpus is read prompts, and
+    read prompts are shorter and cleaner than what somebody says when they are
+    actually asking for something.
+    """
+    wavs = sorted(directory.glob("*.wav"))
+    if not wavs:
+        raise SystemExit(f"no .wav files in {directory}")
+    return [{"id": w.stem, "language": "unknown", "phrase": None, "expect": None,
+             "audio": read_wav(w)} for w in wavs]
+
+
 def load_corpus() -> list[dict]:
     if not MANIFEST.is_file():
         raise SystemExit(
@@ -360,10 +381,14 @@ def score(backend_name: str, cfg, items: list[dict], router: FastRouter,
             # the reported latency of a phrase.
             ms = statistics.median(latencies)
             intent = router.match(result.text)
+            # No reference means no accuracy. None, not 0.0 — a directory of
+            # captures nobody transcribed would otherwise average in as a
+            # perfect score and make the engine look better than it is.
+            reference = item["phrase"]
             rows.append({
                 "id": item["id"],
                 "language": item["language"],
-                "phrase": item["phrase"],
+                "phrase": reference,
                 "expect": item["expect"],
                 "text": result.text,
                 "detected": result.detected,
@@ -371,8 +396,9 @@ def score(backend_name: str, cfg, items: list[dict], router: FastRouter,
                 "duration_s": duration_s,
                 "ms": ms,
                 "rtf": ms / max(duration_s * 1000, 1e-6),
-                "cer": cer(item["phrase"], result.text),
-                "exact": normalise(item["phrase"]) == normalise(result.text),
+                "cer": None if reference is None else cer(reference, result.text),
+                "exact": (None if reference is None
+                          else normalise(reference) == normalise(result.text)),
                 "routed": intent.command.name if intent else None,
             })
 
@@ -391,8 +417,12 @@ def report(run: dict) -> None:
     print(f"{'id':<18} {'CER':>5} {'ms':>7} {'RTF':>5} {'lang':>5}  transcript")
     print("-" * 78)
     for r in rows:
-        flag = "ok " if r["exact"] else ("~  " if r["cer"] < 0.5 else "XX ")
-        print(f"{flag}{r['id']:<15} {r['cer']:>5.2f} {r['ms']:>7.0f} {r['rtf']:>5.2f} "
+        if r["cer"] is None:
+            flag, cer_cell = "   ", "    -"
+        else:
+            flag = "ok " if r["exact"] else ("~  " if r["cer"] < 0.5 else "XX ")
+            cer_cell = f"{r['cer']:>5.2f}"
+        print(f"{flag}{r['id']:<15} {cer_cell} {r['ms']:>7.0f} {r['rtf']:>5.2f} "
               f"{str(r['detected'] or '-'):>5}  {r['text']!r}")
         if r["expect"] and r["routed"] != r["expect"]:
             print(f"{'':<18} {'':>5} {'':>7} {'':>5} {'':>5}  "
@@ -420,10 +450,16 @@ def _summary_line(label: str, group: list[dict]) -> None:
     routable = [r for r in group if r["expect"]]
     hit = sum(1 for r in routable if r["routed"] == r["expect"])
     routed = f"{hit}/{len(routable)}" if routable else "-"
-    print(f"{label:<10} {len(group):>3} "
-          f"{statistics.mean(r['cer'] for r in group):>6.3f} "
-          f"{sum(r['exact'] for r in group):>4}/{len(group):<2} "
-          f"{routed:>8} "
+
+    # Rows with no reference contribute latency and nothing else.
+    scored = [r for r in group if r["cer"] is not None]
+    if scored:
+        cer_cell = f"{statistics.mean(r['cer'] for r in scored):>6.3f}"
+        exact_cell = f"{sum(r['exact'] for r in scored):>4}/{len(scored):<2}"
+    else:
+        cer_cell, exact_cell = f"{'-':>6}", f"{'-':>7}"
+
+    print(f"{label:<10} {len(group):>3} {cer_cell} {exact_cell} {routed:>8} "
           f"{statistics.mean(lat):>8.0f} {p95(lat):>7.0f} "
           f"{statistics.mean(r['rtf'] for r in group):>6.2f}")
 
@@ -447,7 +483,8 @@ def compare(runs: list[dict]) -> None:
     for lang, name in (("zh", "Mandarin"), ("yue", "Cantonese"),
                        ("en", "English"), ("mixed", "Mixed")):
         def acc(run, lang=lang):
-            group = [r for r in run["rows"] if r["language"] == lang]
+            group = [r for r in run["rows"]
+                     if r["language"] == lang and r["cer"] is not None]
             return statistics.mean(r["cer"] for r in group) if group else None
         line(f"{name} CER", acc)
 
@@ -548,6 +585,10 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=3,
                     help="passes per utterance; the median is reported")
     ap.add_argument("--json", type=Path, help="also write the raw rows here")
+    ap.add_argument("--dir", type=Path,
+                    help="score every wav in this directory instead of the recorded "
+                         "corpus. No reference text, so latency/RTF/CPU/RAM only — "
+                         "e.g. .bench/utterances, the assistant's own captures")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -556,7 +597,7 @@ def main() -> int:
     if args.mode == "record":
         return record(args.language)
 
-    items = load_corpus()
+    items = load_directory(args.dir) if args.dir else load_corpus()
     print(f"{len(items)} utterances, "
           f"{sum(len(i['audio']) for i in items) / CONFIG.audio.target_rate:.1f}s of audio")
 
