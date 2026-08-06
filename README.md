@@ -3,13 +3,22 @@
 An offline-first voice assistant that acts as the primary voice interface for the Pi.
 Wake word → speech recognition → intent routing → app control → spoken reply, all on-device.
 
-**Status: v0.3.0 — the voice loop and app control work on real speech. The LLM is not built.**
+**Status: v0.4.4 — the voice loop, app control and the conversation UI work on real speech.
+The LLM is not built.**
 
 M0 measured the target Pi and every check passed; the fast path landed at **1.46 s** (English)
 and **1.58 s** (Mandarin) against a 2.5 s budget. M1 — wake word, capture, endpointing, STT,
 routing, TTS — runs on the device and has been reviewed subsystem by subsystem. Anything the
 router does not recognise is repeated back rather than answered: that is M2's job and there is
 no `aia/llm/` yet. Details and milestones in `docs/PLAN.md`.
+
+Since **v0.4.0** every turn is also written down: the conversation and the saved recordings are
+kept for 24 hours and then deleted, and a page on loopback shows the transcript and what AIA is
+actually running — the STT model, the Piper voices that loaded, and the microphone the open
+capture stream is reading from. See "Screen, transcript and settings".
+
+The version AIA reports is the tag it was deployed from, stamped in by `git archive`; there is
+no version constant in the source to bump.
 
 Requires **Kodama-Lite v0.1.38** or newer for the lyrics commands. Older versions accept the
 request and ignore it — the control endpoint returns 202 for actions it has never heard of, so
@@ -50,6 +59,9 @@ Microphone → Wake Word (always on, ~0.6% CPU)
         Plugin (Kodama-Lite) → MPRIS + control API
                   ↓
               Piper TTS (streaming) → Speaker
+                  ↓
+   every turn recorded, kept 24 h ─→ overlay strip (the current turn)
+                                  └─→ web UI on :8090 (scrollback + settings)
 ```
 
 The router tier is the important part. Qwen2.5 3B benchmarks at 5.67 tok/s on an idle Pi 5 —
@@ -218,6 +230,28 @@ of everything said in the room and has no authentication. Open it in Chromium
 on the Pi, or forward it over ssh (`ssh -L 8090:127.0.0.1:8090 raspberrypi5`).
 `AIA_NO_WEB=1` turns it off.
 
+### 24 hours, and the one exception
+
+Both the conversation database and the saved recordings expire after 24 hours.
+A sweep runs at startup and every 15 minutes.
+
+The exception is that the **newest 100 recordings survive regardless of age**.
+Audio cannot be recaptured — it is a particular speaker, room and microphone on
+a particular day — and the last hundred captures are what a misrecognition is
+diagnosed from. Conversation text has no such exemption and expires outright.
+
+Recording cleanup only ever looks at `*.wav` directly inside
+`.bench/utterances`, never recursively. That is not fussiness: `.bench/` also
+holds `wake-trials-pre-phasefix/`, the only surviving audio captured through the
+decimator bug, and a wider sweep would take it.
+
+```bash
+python -m unittest discover -s tests -t .   # the expiry rules, on any machine
+```
+
+Those tests run on the development machine — no microphone, no ALSA, no numpy.
+Expiry is the one part of this project that is pure enough to check off-device.
+
 ### As a desktop app
 
 `scripts/aia-ui.sh` opens it as a maximised Chromium app window — the same
@@ -307,28 +341,6 @@ instantly every time; `bottom` never does.
 Before blaming the panel, though, check the other cause first: **Kodama-Lite in
 full-screen covers the taskbar**, and its toggle is the icon at top centre of
 its own toolbar. `Alt+F11` (once bound, see above) gets out of it.
-
-### 24 hours, and the one exception
-
-Both the conversation database and the saved recordings expire after 24 hours.
-A sweep runs at startup and every 15 minutes.
-
-The exception is that the **newest 100 recordings survive regardless of age**.
-Audio cannot be recaptured — it is a particular speaker, room and microphone on
-a particular day — and the last hundred captures are what a misrecognition is
-diagnosed from. Conversation text has no such exemption and expires outright.
-
-Recording cleanup only ever looks at `*.wav` directly inside
-`.bench/utterances`, never recursively. That is not fussiness: `.bench/` also
-holds `wake-trials-pre-phasefix/`, the only surviving audio captured through the
-decimator bug, and a wider sweep would take it.
-
-```bash
-python -m unittest discover -s tests -t .   # the expiry rules, on any machine
-```
-
-Those tests run on the development machine — no microphone, no ALSA, no numpy.
-Expiry is the one part of this project that is pure enough to check off-device.
 
 ## Repository layout
 
