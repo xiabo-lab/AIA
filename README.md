@@ -218,6 +218,33 @@ of everything said in the room and has no authentication. Open it in Chromium
 on the Pi, or forward it over ssh (`ssh -L 8090:127.0.0.1:8090 raspberrypi5`).
 `AIA_NO_WEB=1` turns it off.
 
+### As a desktop app
+
+`scripts/aia-ui.sh` opens it as a full-screen kiosk window — all 1920x440,
+**taskbar included**, so there is no panel to click while it is up. **Alt+F4
+closes it.** Install the launcher on the Pi:
+
+```bash
+cp ~/AI_Assit/scripts/aia-ui.desktop ~/Desktop/
+cp ~/AI_Assit/scripts/aia-ui.desktop ~/.local/share/applications/
+```
+
+The script waits for the server before opening, so pressing it at boot lands on
+the UI rather than on Chromium's "site can't be reached" — which in kiosk mode
+needs a reload there is no way to reach. Its own flags are commented in place;
+`--kiosk` rather than `--start-fullscreen` and a private `--user-data-dir` are
+both load-bearing.
+
+### The taskbar must stay at the top
+
+`position=bottom` in `~/.config/wf-panel-pi/wf-panel-pi.ini` does not work on
+this Pi — wf-panel-pi 1.13 with labwc 0.9.8. The panel process starts and stays
+running, but nothing is ever drawn and no exclusive zone is reserved, so a
+maximised window takes the full height and the taskbar is simply gone. Verified
+by screenshot in both positions, and it is not the `monitor=` key, not the
+partial config the panel's own preferences dialog writes, and not autohide:
+`top` maps instantly, `bottom` never does.
+
 ### 24 hours, and the one exception
 
 Both the conversation database and the saved recordings expire after 24 hours.
