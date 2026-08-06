@@ -1,0 +1,445 @@
+<!doctype html>
+<!--
+  AIA's conversation and settings page.
+
+  One file, no build step, no dependencies — it is served by a stdlib HTTP
+  handler from inside the assistant process and rendered on a Pi 5 that is also
+  running a wake recogniser, whisper.cpp and a music player.
+
+  Sized for the 1920x440 display: everything vertical is scarce, so the header
+  is one short row and the chat gets the rest. Settings uses the width instead,
+  as a grid that fits as many cards across as there is room for.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIA</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1e2128;
+    --panel-2: #262a33;
+    --line: #333844;
+    --text: #e8eaed;
+    --muted: #9aa1ad;
+    --accent: #4f8cff;
+    --user: #2f5fbf;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    /* Noto CJK is what Pi OS ships; without it every Mandarin transcript
+       renders as tofu boxes, which is most of what this page shows. */
+    font-family: system-ui, -apple-system, "Noto Sans", "Noto Sans CJK SC",
+                 "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    font-size: 15px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── header ─────────────────────────────────────────────── */
+  header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 10px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 700; letter-spacing: .04em; font-size: 17px; }
+  .brand span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 13px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    font-size: 13px; color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  /* Busy states pulse. On a screen glanced at from across a room, movement is
+     what carries "it is doing something" — colour alone does not. */
+  .pill.busy { color: var(--text); border-color: var(--accent); }
+  .pill.busy .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+  .pill.error { color: var(--bad); border-color: var(--bad); }
+  .pill.error .dot { background: var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .dot { animation: none !important; } }
+
+  nav { margin-left: auto; display: flex; gap: 6px; }
+  nav button {
+    background: transparent; color: var(--muted);
+    border: 1px solid transparent; border-radius: 8px;
+    padding: 6px 16px; font: inherit; font-size: 14px; cursor: pointer;
+  }
+  nav button:hover { color: var(--text); background: var(--panel-2); }
+  nav button[aria-selected="true"] {
+    color: var(--text); background: var(--panel-2); border-color: var(--line);
+  }
+
+  /* ── views ──────────────────────────────────────────────── */
+  main { flex: 1 1 auto; min-height: 0; }
+  .view { display: none; height: 100%; overflow-y: auto; }
+  .view.active { display: block; }
+
+  /* ── conversation ───────────────────────────────────────── */
+  #chat { padding: 16px 20px 24px; }
+  .thread { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+  .msg { display: flex; flex-direction: column; max-width: 72%; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.aia  { align-self: flex-start; align-items: flex-start; }
+  /* Speaker and time share one line. On a 440 px-tall display, a line per
+     message is a whole extra turn of scrollback. */
+  .meta {
+    display: flex; gap: 9px; align-items: baseline;
+    font-size: 11px; color: var(--muted); margin: 0 5px 3px;
+  }
+  .who { letter-spacing: .05em; text-transform: uppercase; }
+  .when { font-variant-numeric: tabular-nums; }
+  .bubble {
+    padding: 9px 15px; border-radius: 14px; line-height: 1.45;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .msg.user .bubble { background: var(--user); border-bottom-right-radius: 4px; }
+  .msg.aia  .bubble { background: var(--panel-2); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+
+  .empty { color: var(--muted); text-align: center; padding: 60px 20px; line-height: 1.6; }
+
+  /* The live indicator, pinned under the last message while a turn runs. */
+  #live { display: none; align-self: flex-start; align-items: center; gap: 9px;
+          color: var(--muted); font-size: 13px; padding: 4px 4px 0; }
+  #live.on { display: flex; }
+  #live .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+
+  /* ── settings ───────────────────────────────────────────── */
+  #settings { padding: 16px 20px 24px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .card h2 {
+    margin: 0 0 10px; font-size: 12px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--accent); font-weight: 700;
+  }
+  .card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
+  .card dt { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .card dd {
+    margin: 0; font-size: 13px; text-align: right;
+    overflow-wrap: anywhere;
+    font-variant-numeric: tabular-nums;
+  }
+  .mono { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-size: 12px; }
+  .good { color: var(--ok); }
+  .bad  { color: var(--bad); }
+  .warn { color: var(--warn); }
+  .note { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 10px; }
+  .foot { max-width: 1100px; margin: 14px auto 0; color: var(--muted); font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">AIA<span id="version">—</span></div>
+  <div class="pill" id="state"><span class="dot"></span><span id="stateText">connecting</span></div>
+  <nav>
+    <button id="tabChat" aria-selected="true">Conversation</button>
+    <button id="tabSettings" aria-selected="false">Settings</button>
+  </nav>
+</header>
+
+<main>
+  <section class="view active" id="chat">
+    <div class="thread" id="thread">
+      <div class="empty" id="empty">No conversation yet.<br>Say 小艾同学 to start one.</div>
+      <div id="live"><span class="dot"></span><span id="liveText"></span></div>
+    </div>
+    <div class="foot" id="retentionNote"></div>
+  </section>
+
+  <section class="view" id="settings">
+    <div class="grid" id="cards"></div>
+    <div class="foot">Read-only. AIA is controlled by speaking to it.</div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ── state ────────────────────────────────────────────────────────────
+let lastId = 0;          // highest message id seen; the feed is incremental
+let retentionHours = 24;
+let clockSkew = 0;       // device time minus browser time, in seconds
+
+const thread = document.getElementById("thread");
+const empty = document.getElementById("empty");
+const live = document.getElementById("live");
+const liveText = document.getElementById("liveText");
+const statePill = document.getElementById("state");
+const stateText = document.getElementById("stateText");
+
+// What each state of aia/core/state.py means to somebody watching the screen.
+// `idle` is the only one that is not "AIA is busy with your turn".
+const STATES = {
+  idle:      { label: "Idle",       live: null },
+  listening: { label: "Listening",  live: "Listening…" },
+  thinking:  { label: "Thinking",   live: "Transcribing and working out what you meant…" },
+  acting:    { label: "Working",    live: "Doing it…" },
+  speaking:  { label: "Speaking",   live: "Replying…" },
+  error:     { label: "Error",      live: null },
+};
+
+// ── tabs ─────────────────────────────────────────────────────────────
+const tabs = [
+  [document.getElementById("tabChat"), document.getElementById("chat")],
+  [document.getElementById("tabSettings"), document.getElementById("settings")],
+];
+tabs.forEach(([button, view]) => {
+  button.addEventListener("click", () => {
+    tabs.forEach(([b, v]) => {
+      const on = b === button;
+      b.setAttribute("aria-selected", String(on));
+      v.classList.toggle("active", on);
+    });
+    // System information is fetched on demand rather than polled: it costs an
+    // amixer subprocess or two on the device, and it does not change on its own.
+    if (view.id === "settings") loadSystem();
+  });
+});
+
+// ── conversation ─────────────────────────────────────────────────────
+function clockTime(seconds) {
+  const d = new Date(seconds * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+function addMessage(m) {
+  const row = document.createElement("div");
+  row.className = "msg " + (m.role === "user" ? "user" : "aia");
+
+  const who = document.createElement("span");
+  who.className = "who";
+  who.textContent = m.role === "user" ? "You" : "AIA";
+
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = clockTime(m.ts);
+  when.title = new Date(m.ts * 1000).toLocaleString();
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  // The user's own words go on the right, so the label reads inwards.
+  meta.append(...(m.role === "user" ? [when, who] : [who, when]));
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  // textContent, never innerHTML. This text came out of a speech recogniser
+  // listening to a room, so it is untrusted input by definition.
+  bubble.textContent = m.text;
+
+  row.append(meta, bubble);
+  // Always above the live indicator, which stays pinned at the bottom.
+  thread.insertBefore(row, live);
+}
+
+function atBottom() {
+  const view = document.getElementById("chat");
+  return view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+}
+
+function scrollToLatest() {
+  const view = document.getElementById("chat");
+  view.scrollTop = view.scrollHeight;
+}
+
+function showState(name) {
+  const s = STATES[name] || { label: name, live: null };
+  stateText.textContent = s.label;
+  statePill.classList.toggle("busy", Boolean(s.live));
+  statePill.classList.toggle("error", name === "error");
+  live.classList.toggle("on", Boolean(s.live));
+  if (s.live) liveText.textContent = s.live;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/feed?since=" + lastId, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+
+    clockSkew = data.now - Date.now() / 1000;
+    if (data.retention_hours !== retentionHours) {
+      retentionHours = data.retention_hours;
+      document.getElementById("retentionNote").textContent =
+        "History is kept for " + retentionHours + " hours, then deleted automatically.";
+    }
+
+    if (data.messages.length) {
+      const follow = atBottom();
+      for (const m of data.messages) {
+        addMessage(m);
+        lastId = Math.max(lastId, m.id);
+      }
+      empty.style.display = "none";
+      // Only chase the bottom if the reader was already there. Yanking the
+      // view down while somebody is reading back through the day is worse
+      // than making them scroll.
+      if (follow) scrollToLatest();
+    } else if (lastId === 0) {
+      empty.style.display = "";
+    }
+
+    showState(data.state);
+  } catch (err) {
+    stateText.textContent = "Not connected";
+    statePill.classList.remove("busy");
+    live.classList.remove("on");
+  } finally {
+    // Chained rather than setInterval, so a slow response cannot stack
+    // requests up behind itself. Slower when the tab is hidden — this runs on
+    // the same four cores as the voice pipeline.
+    setTimeout(poll, document.hidden ? 5000 : 1200);
+  }
+}
+
+// ── settings ─────────────────────────────────────────────────────────
+function card(title, rows, note) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const h = document.createElement("h2");
+  h.textContent = title;
+  el.appendChild(h);
+
+  const dl = document.createElement("dl");
+  for (const [label, value, cls] of rows) {
+    if (value === undefined || value === null || value === "") continue;
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (cls) dd.className = cls;
+    dl.append(dt, dd);
+  }
+  el.appendChild(dl);
+
+  if (note) {
+    const p = document.createElement("p");
+    p.className = "note";
+    p.textContent = note;
+    el.appendChild(p);
+  }
+  return el;
+}
+
+function duration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h) return h + " h " + m + " min";
+  if (m) return m + " min";
+  return Math.round(seconds) + " s";
+}
+
+function modelLabel(file) {
+  if (!file) return null;
+  if (!file.present) return file.name + " (missing)";
+  return file.size_mb ? file.name + " · " + file.size_mb + " MB" : file.name;
+}
+
+async function loadSystem() {
+  const cards = document.getElementById("cards");
+  let d;
+  try {
+    const r = await fetch("/api/system", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    d = await r.json();
+  } catch (err) {
+    cards.replaceChildren(card("System", [["Status", "unavailable", "bad"]]));
+    return;
+  }
+
+  document.getElementById("version").textContent = d.aia.version;
+
+  const out = [];
+
+  out.push(card("AIA", [
+    ["Version", d.aia.version],
+    ["Version from", d.aia.version_source],
+    ["Uptime", duration(d.aia.uptime_s)],
+    ["Host", d.aia.host],
+    ["Platform", d.aia.platform],
+    ["Python", d.aia.python],
+  ]));
+
+  out.push(card("Speech to text", [
+    ["Engine", d.stt.engine],
+    ["Model", modelLabel(d.stt.model), d.stt.model.present ? null : "bad"],
+    ["Language", d.stt.language],
+    ["Supported", d.stt.supported_languages.join(", ")],
+    ["Audio context", d.stt.audio_ctx + " (" + (d.stt.readable_audio_ms / 1000) + " s readable)"],
+    ["Server", d.stt.url, "mono"],
+  ]));
+
+  const voices = (d.tts.voices || []).map((v) => [
+    "Voice · " + v.language,
+    v.model + (v.sample_rate ? " · " + v.sample_rate + " Hz" : "") +
+      (v.loaded === false ? " (not loaded)" : v.running === false ? " (stopped)" : ""),
+    v.loaded === false || v.running === false ? "bad" : null,
+  ]);
+  out.push(card("Text to speech", [
+    ["Engine", d.tts.engine],
+    ["Binary", d.tts.binary.present ? "present" : "missing",
+      d.tts.binary.present ? "good" : "bad"],
+    ...voices,
+  ]));
+
+  out.push(card("Language model", [
+    ["Provider", d.llm.provider || "—"],
+    ["Model", d.llm.model || "—"],
+    ["Status", d.llm.status, d.llm.provider ? "good" : "warn"],
+    ["Local", d.llm.local === null ? "—" : d.llm.local ? "on device" : "online"],
+  ], d.llm.note));
+
+  const mic = d.microphone;
+  if (mic.status === "in use") {
+    const agcGood = mic.agc === "off";
+    out.push(card("Microphone", [
+      ["Device", mic.name],
+      ["Profile", mic.profile],
+      ["ALSA card", mic.alsa_card === null ? "unknown" : String(mic.alsa_card)],
+      ["Card", mic.card_description],
+      ["Capture", mic.capture_rate + " Hz → " + mic.sample_rate + " Hz"],
+      ["Channels", String(mic.channels) + " · " + mic.sample_format],
+      ["Gain", mic.gain],
+      ["Auto Gain Control", mic.agc, agcGood ? "good" : "warn"],
+      ["Clipped samples", mic.clipped_samples > 0 ? String(mic.clipped_samples) : "none",
+        mic.clipped_samples > 0 ? "warn" : "good"],
+    ], mic.clipped_samples > 0
+        ? "Samples have hit full scale. A microphone near full scale cannot be endpointed — every utterance runs to the capture cap. Lower the gain."
+        : "Read back from the open capture stream and the mixer itself, not from the configured device."));
+  } else {
+    out.push(card("Microphone", [["Status", mic.status, "bad"]]));
+  }
+
+  out.push(card("Data retention", [
+    ["Conversation", d.retention.hours + " hours"],
+    ["Recordings", d.retention.hours + " hours"],
+    ["Recordings kept", "newest " + d.retention.keep_recordings],
+    ["Sweep", "every " + duration(d.retention.sweep_interval_s)],
+    ["Database", d.retention.database, "mono"],
+    ["Recordings path", d.retention.recordings, "mono"],
+  ], "The newest recordings are kept regardless of age so a misrecognition can still be diagnosed; everything beyond them expires on the clock."));
+
+  cards.replaceChildren(...out);
+}
+
+// ── go ───────────────────────────────────────────────────────────────
+poll();
+loadSystem();
+</script>
+</body>
+</html>

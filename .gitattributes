@@ -19,3 +19,14 @@
 # Generated from plugin.manifest() — regenerate rather than editing.
 commands.txt   text eol=lf
 commands.html  text eol=lf
+
+# Served to a browser by aia/ui/server.py, so the same LF rule applies for the
+# same reason as everything else the Pi executes.
+*.html  text eol=lf
+
+# The version AIA reports comes from the tag it was archived at, and this is
+# what substitutes it. The Pi has no .git — it is deployed with
+# `git archive <tag> aia scripts | ssh …` — so without this line the settings
+# page falls back to `git describe`, which cannot run there, and reports
+# "unknown". See aia/_version.py.
+aia/_version.py  export-subst

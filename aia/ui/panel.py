@@ -53,11 +53,23 @@ def _system_python() -> str | None:
 
 
 class Panel:
-    """The on-screen conversation, or a no-op if it cannot be shown."""
+    """The conversation feed: on screen, and written down.
 
-    def __init__(self, enabled: bool = True):
+    Both destinations hang off this one object because this is already the
+    place every line of the conversation passes through — `main.py` calls
+    `user()` and `aia()` at exactly the moments a transcript and a reply exist,
+    and threading a second recorder through those same nine call sites would be
+    two things to keep in step instead of one.
+
+    The `history` sink is optional and, like the overlay, must never cost the
+    user a command: `ConversationLog.record` enqueues and returns without
+    touching a disk.
+    """
+
+    def __init__(self, enabled: bool = True, history=None):
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._history = history
         if not enabled:
             log.info("conversation overlay disabled")
             return
@@ -106,15 +118,32 @@ class Panel:
             log.warning("overlay write failed: %s", exc)
             self._proc = None
 
+    def _record(self, role: str, text: str, language: str | None) -> None:
+        if self._history is None:
+            return
+        try:
+            self._history.record(role, text, language)
+        except Exception:
+            # Same contract as the overlay: losing the transcript is a shame,
+            # dropping the turn over it would be a fault.
+            log.warning("could not record the conversation", exc_info=True)
+
     def status(self, text: str) -> None:
-        """A transient line — replaced by the next real message."""
+        """A transient line — replaced by the next real message.
+
+        Not recorded. "Listening…" is the overlay saying it is awake, not
+        something anybody said, and storing it would put a line of furniture
+        between every real turn of the transcript.
+        """
         self._send({"role": "status", "text": text})
 
-    def user(self, text: str) -> None:
+    def user(self, text: str, language: str | None = None) -> None:
         self._send({"role": "user", "text": text})
+        self._record("user", text, language)
 
-    def aia(self, text: str) -> None:
+    def aia(self, text: str, language: str | None = None) -> None:
         self._send({"role": "aia", "text": text})
+        self._record("aia", text, language)
 
     def hide(self) -> None:
         self._send({"cmd": "hide"})

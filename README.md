@@ -92,6 +92,9 @@ systemctl --user restart aia           # after changing the code
 systemctl --user stop aia              # free the mic for scripts/wake_test.py
 ```
 
+It also serves a page at **http://127.0.0.1:8090** — the last 24 hours of
+conversation, and what it is running. See "Screen, transcript and settings".
+
 To run it by hand instead — say, to try an environment variable:
 
 ```bash
@@ -192,18 +195,65 @@ nothing:
 python scripts/replay.py .bench/en2s.wav .bench/zh16.wav
 ```
 
+## Screen, transcript and settings
+
+There are two displays, and they answer different questions.
+
+**The overlay** is a Wayland layer-shell strip over whatever is running. It
+shows the current turn — "Listening…", what was heard, what was answered — and
+fades after five seconds. It never takes focus, which is what stops it stealing
+the keyboard from the full-screen player, and which is also why it cannot be
+scrolled.
+
+**The web UI**, at `http://127.0.0.1:8090`, is for everything the strip cannot
+hold: scrollback through the last 24 hours, and a settings page reporting the
+AIA version, the STT model, the Piper voices that actually loaded, the LLM
+(there isn't one yet — M2), and **the microphone AIA is really using**, read
+back from the open capture stream and the ALSA mixer rather than from config.
+Gain and AGC come from `amixer` itself, so what is on screen is what the
+hardware is set to.
+
+It is read-only and bound to **loopback**, deliberately: it serves a transcript
+of everything said in the room and has no authentication. Open it in Chromium
+on the Pi, or forward it over ssh (`ssh -L 8090:127.0.0.1:8090 raspberrypi5`).
+`AIA_NO_WEB=1` turns it off.
+
+### 24 hours, and the one exception
+
+Both the conversation database and the saved recordings expire after 24 hours.
+A sweep runs at startup and every 15 minutes.
+
+The exception is that the **newest 100 recordings survive regardless of age**.
+Audio cannot be recaptured — it is a particular speaker, room and microphone on
+a particular day — and the last hundred captures are what a misrecognition is
+diagnosed from. Conversation text has no such exemption and expires outright.
+
+Recording cleanup only ever looks at `*.wav` directly inside
+`.bench/utterances`, never recursively. That is not fussiness: `.bench/` also
+holds `wake-trials-pre-phasefix/`, the only surviving audio captured through the
+decimator bug, and a wider sweep would take it.
+
+```bash
+python -m unittest discover -s tests -t .   # the expiry rules, on any machine
+```
+
+Those tests run on the development machine — no microphone, no ALSA, no numpy.
+Expiry is the one part of this project that is pure enough to check off-device.
+
 ## Repository layout
 
 ```
 aia/
-  core/      state machine, event bus, config
+  core/      state machine, config, system information
   audio/     wake word, VAD, capture
   stt/       whisper.cpp wrapper
   router/    fast phrase matcher (the LLM client lands with M2)
   tts/       Piper synthesis, language resolution
   plugins/   plugin ABC + per-app handlers
+  ui/        overlay strip, conversation history, retention, web UI
 docs/PLAN.md the full plan, milestones and open risks
 scripts/     bench_m0.sh and setup helpers
+tests/       retention and history — the off-device testable part
 models/      ggml / gguf / onnx (gitignored)
 vendor/      built third-party binaries (gitignored)
 ```

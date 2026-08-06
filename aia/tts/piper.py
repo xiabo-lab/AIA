@@ -86,6 +86,15 @@ class Voice:
         wav_path.unlink(missing_ok=True)
         return data, rate
 
+    def alive(self) -> bool:
+        """Is the resident process still there?
+
+        `synth` raises on a dead one, so this is only for reporting — a voice
+        whose Piper has exited is a language that has gone silent, and that is
+        worth being able to see rather than discover by asking a question in it.
+        """
+        return self._proc.poll() is None
+
     def close(self) -> None:
         try:
             if self._proc.stdin:
@@ -107,6 +116,29 @@ class Speaker:
                             lang, model)
                 continue
             self._voices[lang] = Voice(cfg.binary, model, cfg.scratch)
+
+    def describe(self) -> list[dict]:
+        """The voices that are actually loaded, for the settings page.
+
+        Read from the `Voice` objects rather than from `TtsConfig.voices`,
+        because a voice whose .onnx is missing is skipped at construction with
+        a warning and that language is silent. Listing the configured set would
+        show it as present.
+
+        `sample_rate` comes from each voice's own JSON — the config field of
+        the same name is only the fallback for a voice whose JSON cannot be
+        read, and a mismatch there is audible as a pitch shift.
+        """
+        return [
+            {
+                "language": lang,
+                "model": voice.model.name,
+                "sample_rate": voice.sample_rate,
+                "loaded": True,
+                "running": voice.alive(),
+            }
+            for lang, voice in self._voices.items()
+        ]
 
     def warm(self) -> None:
         """Force each voice to load now, off the critical path.

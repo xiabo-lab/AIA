@@ -14,6 +14,11 @@ Useful environment variables:
     AIA_NO_WAKE=1     skip wake-word gating; any speech is a command
     AIA_DEBUG=1       debug-level logging
     AIA_SAVE_AUDIO=1  keep each captured utterance under .bench/utterances
+    AIA_NO_PANEL=1    no on-screen overlay
+    AIA_NO_WEB=1      no web UI (it is otherwise on http://127.0.0.1:8090)
+
+The conversation and the saved recordings are both kept for 24 hours and then
+deleted; see aia/ui/retention.py.
 """
 
 from __future__ import annotations
@@ -25,13 +30,13 @@ import sys
 from dataclasses import replace
 import time
 import wave
-from pathlib import Path
 
 from aia.audio import wake as wake_mod
 from aia.audio.capture import Microphone
 from aia.audio.ducking import Ducker
 from aia.audio.vad import Endpointer
-from aia.core.config import CONFIG
+from aia.core.config import CONFIG, RetentionConfig
+from aia.core.info import SystemInfo
 from aia.core.state import Machine, State
 from aia.plugins.base import Registry, Result
 from aia.plugins.kodama import KodamaLite
@@ -40,7 +45,10 @@ from aia.router.fast import FastRouter, normalise
 from aia.stt.engine import SpeechToText, detect_script
 from aia.tts.language import reply_language
 from aia.tts.piper import Speaker
+from aia.ui.history import ConversationLog
 from aia.ui.panel import Panel
+from aia.ui.retention import Retention
+from aia.ui.server import WebUI
 
 log = logging.getLogger("aia")
 
@@ -77,12 +85,6 @@ CONFIRM_LISTEN = {"en": "Say yes or no…", "zh": "请回答“确定”或“�
 # than merely wasteful. Short enough that a genuine second attempt straight
 # after a false one is not swallowed.
 EMPTY_TURN_REFRACTORY_S = 1.0
-
-# Never prune the utterance directory below this, whatever `keep_utterances`
-# says. Recordings cannot be remade — they are a particular speaker, room and
-# microphone on a particular day — so an implausibly small value is a mistake
-# rather than a request. See `save_utterance`.
-_MIN_KEEP = 25
 
 _YES = ("yes", "yeah", "yep", "sure", "confirm", "do it", "go ahead", "ok", "okay",
         "是", "是的", "对", "确定", "确认", "好", "好的", "可以", "没错")
@@ -148,7 +150,7 @@ def is_affirmative(text: str) -> bool | None:
     return None
 
 
-def save_utterance(audio, rate: int, keep: int) -> None:
+def save_utterance(audio, rate: int, keep: int, retention: RetentionConfig) -> None:
     """Write the captured utterance to .bench/utterances for offline replay.
 
     Every accuracy number so far came from synthesised speech, which is clean,
@@ -166,8 +168,13 @@ def save_utterance(audio, rate: int, keep: int) -> None:
 
     Oldest go first. A misrecognition is diagnosed within days or not at all,
     and the newest are the ones anybody asks about.
+
+    This is the count cap only. Recordings also expire on the clock, which is
+    the rule that actually bounds how long anything said in this room is kept —
+    see `aia/ui/retention.py`. The two agree on a directory because both read
+    it from `RetentionConfig` rather than each working one out.
     """
-    directory = Path(__file__).resolve().parents[1] / ".bench" / "utterances"
+    directory = retention.recordings
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}.wav"
     with wave.open(str(path), "wb") as w:
@@ -183,10 +190,15 @@ def save_utterance(audio, rate: int, keep: int) -> None:
     # This is not hypothetical: a test called this with keep=3 against the
     # live directory and took 101 captures down to 3, and the numbers derived
     # from them survive only because they were written into commit messages.
-    if keep < _MIN_KEEP:
+    #
+    # The floor is `retention.keep_recordings`, the same number the expiry
+    # sweep refuses to delete below, so there is one answer to "how many
+    # captures are guaranteed to survive" rather than two that can drift.
+    floor = retention.keep_recordings
+    if keep < floor:
         log.warning("keep=%d is below the %d-file floor; keeping %d instead",
-                    keep, _MIN_KEEP, _MIN_KEEP)
-        keep = _MIN_KEEP
+                    keep, floor, floor)
+        keep = floor
 
     # Names are timestamps, so sorting by name is sorting by age.
     existing = sorted(directory.glob("*.wav"))
@@ -200,7 +212,16 @@ def save_utterance(audio, rate: int, keep: int) -> None:
 def main() -> int:
     setup_logging()
     cfg = CONFIG
+    started = time.time()
     save_audio = os.environ.get("AIA_SAVE_AUDIO") == "1"
+
+    # Started before anything that can be slow, so a restart also expires
+    # whatever the last session left behind — a machine that has been off for a
+    # week comes back with an empty transcript rather than a week-old one, and
+    # the sweep has happened before the first turn can add to it.
+    history = ConversationLog(cfg.retention.database)
+    retention = Retention(cfg.retention, history)
+    retention.start()
 
     # The rate is passed, not defaulted. `SpeechToText` writes it into the WAV
     # header, and a header that disagrees with the samples does not fail — it
@@ -215,7 +236,7 @@ def main() -> int:
     speaker = Speaker(cfg.tts)
     speaker.warm()
 
-    panel = Panel(enabled=os.environ.get("AIA_NO_PANEL") != "1")
+    panel = Panel(enabled=os.environ.get("AIA_NO_PANEL") != "1", history=history)
 
     registry = Registry([KodamaLite(), System()])
     router = FastRouter(registry)
@@ -247,13 +268,28 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    # Cleanup belongs on every exit path, not just the tidy one. These
-    # three own real resources — the Vosk recogniser and both resident
-    # Piper processes — and an exception escaping the loop used to skip
-    # all of them. systemd papers over it by killing the whole cgroup;
-    # `python -m aia.main` by hand, which the README documents, does not.
+    web = WebUI(
+        cfg.ui,
+        history=history,
+        # Built here but handed the microphone below, once there is one: the
+        # settings page has to report the capsule the open stream is actually
+        # reading from, and before `Microphone` exists the honest answer is
+        # "not open".
+        info=SystemInfo(cfg, speaker=speaker, started=started),
+        state=lambda: machine.state.value,
+        retention_hours=cfg.retention.hours,
+    )
+
+    # Cleanup belongs on every exit path, not just the tidy one. These own
+    # real resources — the Vosk recogniser, both resident Piper processes, a
+    # listening socket and a database connection — and an exception escaping
+    # the loop used to skip all of them. systemd papers over it by killing the
+    # whole cgroup; `python -m aia.main` by hand, which the README documents,
+    # does not.
     try:
         with Microphone(cfg.audio) as mic:
+            web.info.mic = mic
+            web.start()
             frames = mic.frames()
             log.info("AIA ready — say the wake word")
             last_empty_turn = 0.0
@@ -292,7 +328,8 @@ def main() -> int:
                 audio = endpointer.collect(frames)
                 turn.mark("captured")
                 if audio is not None and save_audio:
-                    save_utterance(audio, cfg.audio.target_rate, cfg.audio.keep_utterances)
+                    save_utterance(audio, cfg.audio.target_rate,
+                                   cfg.audio.keep_utterances, cfg.retention)
                 if audio is None:
                     # Nothing was said — a false wake, or the user changed their
                     # mind. Put the music straight back and take the "Listening…"
@@ -331,7 +368,7 @@ def main() -> int:
                         machine.to(State.SPEAKING)
                         apology = ("I'm sorry, could you repeat that?"
                                    if stt_language == "en" else "抱歉，请再说一遍。")
-                        panel.aia(apology)
+                        panel.aia(apology, stt_language)
                         speaker.say(apology, stt_language)
                         machine.end_turn()
                         detector.reset()
@@ -342,7 +379,7 @@ def main() -> int:
                     stt_language = result.language
                     # What it heard, before it acts on it — so a misrecognition is
                     # visible rather than something to infer from a wrong action.
-                    panel.user(text)
+                    panel.user(text, lang)
 
                     intent = router.match(text)
                     turn.mark("routed")
@@ -361,7 +398,7 @@ def main() -> int:
                         log.info("asking to confirm %s.%s",
                                  intent.plugin.name, intent.command.name)
                         machine.to(State.SPEAKING)
-                        panel.aia(question)
+                        panel.aia(question, lang)
                         # Blocking: the answer must not be recorded over our own
                         # question, and the microphone is drained straight after.
                         speaker.say(question, lang, blocking=True)
@@ -376,7 +413,7 @@ def main() -> int:
                             # holding the floor, so there is nothing to detect.
                             answer = stt.listen(answer_audio, language=lang)
                             if answer.text.strip():
-                                panel.user(answer.text)
+                                panel.user(answer.text, lang)
                                 decision = is_affirmative(answer.text)
                             log.info("confirmation answer %r -> %s", answer.text, decision)
                         else:
@@ -413,7 +450,7 @@ def main() -> int:
                     # millisecond while synthesis costs a few hundred, so showing
                     # it first means the reply appears as the voice starts rather
                     # than after it.
-                    panel.aia(reply)
+                    panel.aia(reply, lang)
                     # Mark when audio STARTS, not when it finishes. Timing a
                     # blocking play charges the whole spoken reply to the turn —
                     # a two-second sentence looked like two seconds of latency,
@@ -439,7 +476,7 @@ def main() -> int:
                     try:
                         trouble = ("Sorry, something went wrong." if stt_language == "en"
                                    else "抱歉，出错了。")
-                        panel.aia(trouble)
+                        panel.aia(trouble, stt_language)
                         speaker.say(trouble, stt_language)
                     except Exception:
                         log.exception("could not announce the failed turn")
@@ -465,6 +502,11 @@ def main() -> int:
         detector.close()
         speaker.close()
         panel.close()
+        web.stop()
+        retention.stop()
+        # Last, so anything the final turn queued is written before the
+        # database connection goes.
+        history.close()
 
     return 0
 

@@ -319,6 +319,76 @@ class SttConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    """How long AIA keeps what it recorded and what it heard.
+
+    One number, `hours`, governs both the conversation database and the saved
+    audio, because they are the same promise to the person in the room: nothing
+    said here outlives a day.
+
+    The audio has a second rule the text does not. Recordings cannot be remade —
+    they are a particular speaker, room and microphone on a particular day — and
+    a test that pruned the live directory to 3 files once destroyed 101 of them.
+    So `keep_recordings` protects the newest N regardless of age, and only files
+    *beyond* that set are subject to the clock. Conversation text carries no such
+    exception: it expires at `hours` and that is all.
+    """
+
+    hours: float = 24.0
+
+    # Where AIA_SAVE_AUDIO writes captured utterances. Named here rather than
+    # rebuilt from __file__ at the two places that touch it, because a writer
+    # and a deleter that each work out their own path are one refactor away
+    # from disagreeing — and the way that disagreement presents is a cleanup
+    # pointed at the wrong directory.
+    #
+    # It must stay this specific. `.bench/` also holds `wake-trials-*`, which
+    # are irreplaceable measurement corpora — 27 recordings captured through
+    # the broken decimator, the only surviving "before" audio in the project.
+    # Nothing here may ever be widened to `.bench` itself.
+    recordings: Path = ROOT / ".bench" / "utterances"
+
+    # The newest recordings, always kept, however old they are. A floor rather
+    # than a target: on a quiet day the clock alone would empty the directory,
+    # and the last hundred captures are what a misrecognition is diagnosed from.
+    keep_recordings: int = 100
+
+    database: Path = ROOT / "conversation_history.db"
+
+    # How often the sweep runs. Expiry is not a deadline — a recording that
+    # lives an extra quarter of an hour costs nothing — and a sweep that runs
+    # constantly is a wakeup on a device whose whole job is to be listening.
+    sweep_interval_s: float = 900.0
+
+    @property
+    def seconds(self) -> float:
+        return self.hours * 3600.0
+
+
+@dataclass(frozen=True)
+class UiConfig:
+    """The conversation and settings web UI.
+
+    **Loopback by default, and think before changing it.** This serves a
+    transcript of everything said in the room, which is a more sensitive thing
+    than it first sounds, and there is no authentication in front of it. The
+    same reasoning is why Kodama-Lite's control endpoint binds loopback under a
+    random token rather than a fixed public port.
+    """
+
+    host: str = "127.0.0.1"
+    port: int = 8090
+
+    # How many messages the page loads on first paint. The display is 440 px
+    # tall, so this is scrollback, not a screenful.
+    backlog: int = 200
+
+    # Set AIA_NO_WEB=1 to run without it — the voice loop does not depend on
+    # this in any way, and a port already in use must not stop the assistant.
+    enabled: bool = field(default_factory=lambda: os.environ.get("AIA_NO_WEB") != "1")
+
+
+@dataclass(frozen=True)
 class KodamaConfig:
     """Talking to the music player."""
 
@@ -362,6 +432,8 @@ class Config:
     stt: SttConfig = field(default_factory=SttConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     kodama: KodamaConfig = field(default_factory=KodamaConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
 
     # Fast-path target from the spec. Exceeding it is not fatal, but the
     # state machine logs a warning so regressions surface in the journal
@@ -389,6 +461,20 @@ class Config:
                 f"whisper will read at stt.audio_ctx={self.stt.audio_ctx} "
                 f"({readable} ms). Audio past that is discarded silently. "
                 f"Raise audio_ctx or lower max_utterance_ms."
+            )
+
+        # Two rules delete recordings and they must not contradict each other.
+        # `keep_recordings` is a promise that the newest N survive whatever the
+        # clock says; `keep_utterances` is the count cap the writer applies on
+        # every turn. A floor above the cap is a promise the cap immediately
+        # breaks — the retention sweep would spare files that `save_utterance`
+        # had already deleted, so the floor would silently mean the cap.
+        if self.retention.keep_recordings > self.audio.keep_utterances:
+            raise ValueError(
+                f"retention.keep_recordings={self.retention.keep_recordings} is above "
+                f"audio.keep_utterances={self.audio.keep_utterances}, so the count cap "
+                f"would delete recordings the retention floor promises to keep. "
+                f"Raise keep_utterances or lower keep_recordings."
             )
 
 

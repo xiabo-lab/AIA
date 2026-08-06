@@ -12,7 +12,9 @@ import logging
 import queue
 import re
 import subprocess
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -136,19 +138,42 @@ def _stale(candidates: list[tuple[int, dict, MicProfile]]) -> bool:
     return any(_hw_card(dev["name"]) not in live for _, dev, _p in candidates)
 
 
+def _amixer_read(card: int, control: str) -> str:
+    """Raw `amixer sget` output for one control, or "" if it cannot be read."""
+    try:
+        r = subprocess.run(["amixer", "-c", str(card), "sget", control],
+                           capture_output=True, timeout=5, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
 def _mixer_state(card: int) -> str:
     """What the `Mic` control actually reads back, for the log line.
 
     Applying a setting and reporting the setting you *asked for* is how a
     microphone ends up documented at a gain it is not at. Read it back.
     """
-    try:
-        r = subprocess.run(["amixer", "-c", str(card), "sget", "Mic"],
-                           capture_output=True, timeout=5, text=True)
-    except (OSError, subprocess.SubprocessError):
-        return "unreadable"
-    m = re.search(r"Capture (\d+) \[\d+%\] \[(-?[\d.]+dB)\]", r.stdout)
+    m = re.search(r"Capture (\d+) \[\d+%\] \[(-?[\d.]+dB)\]", _amixer_read(card, "Mic"))
     return f"{m.group(1)} ({m.group(2)})" if m else "unreadable"
+
+
+def _agc_state(card: int) -> str:
+    """Whether Auto Gain Control is actually on, read back the same way.
+
+    Worth surfacing next to the gain rather than reporting what the profile
+    asked for. AGC winds gain into the rail on its own schedule, and a
+    microphone near full scale cannot be endpointed — every utterance runs to
+    `max_utterance_ms` because webrtcvad calls every frame speech. That is the
+    single worst failure this subsystem has had, and "is AGC off?" is the first
+    question to ask about it. A device that does not expose the control at all
+    reads as unavailable, which is different from off.
+    """
+    out = _amixer_read(card, "Auto Gain Control")
+    if not out:
+        return "not available"
+    m = re.search(r"\[(on|off)\]", out)
+    return m.group(1) if m else "unreadable"
 
 
 def _apply_profile(prof: MicProfile, card: int | None) -> None:
@@ -209,9 +234,28 @@ def _refresh_portaudio() -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class Selection:
+    """The microphone that was actually opened.
+
+    Kept as a value rather than left inside the log line it used to be
+    formatted into. The settings UI has to report the microphone AIA is using,
+    and re-deriving that later would re-run the whole preference walk and could
+    easily answer with a *different* device than the one the open stream is
+    reading from — which is the exact confusion this project already spent a
+    long hunt on. Whatever `find_input_device` chose is recorded here and read
+    from there afterwards.
+    """
+
+    index: int
+    profile: MicProfile
+    name: str
+    card: int | None
+
+
 def find_input_device(profiles: Sequence[MicProfile], allow_refresh: bool = False,
-                      quiet: bool = False) -> tuple[int, MicProfile]:
-    """Index and profile of the most preferred microphone that is plugged in.
+                      quiet: bool = False) -> Selection:
+    """The most preferred microphone that is plugged in, as a `Selection`.
 
     Matching on name rather than a fixed index because the ALSA card number
     moves when other USB audio is present — the mic came up as hw:2,0 here,
@@ -273,7 +317,7 @@ def find_input_device(profiles: Sequence[MicProfile], allow_refresh: bool = Fals
                  _live_cards().get(card, "not in /proc/asound — list is stale"),
                  prof.note or prof.match,
                  "?" if card is None else _mixer_state(card))
-        return idx, prof
+        return Selection(idx, prof, dev["name"].strip(), card)
 
     # Not found is two different faults wearing the same face, and by far the
     # likelier one is that the device is fine and somebody else has it: ALSA
@@ -377,7 +421,11 @@ class Microphone:
 
     def __init__(self, cfg: AudioConfig):
         self.cfg = cfg
-        self.device, self.profile = find_input_device(cfg.microphones)
+        self.selection = find_input_device(cfg.microphones)
+        # Re-read on every reopen, so a re-plug that lands on a different
+        # capsule is reflected wherever this is reported.
+        self._described: tuple[float, dict] | None = None
+        self._describe_lock = threading.Lock()
 
         # Holds capture-rate audio; the consumer downsamples. Bounding this by a
         # count of *blocks* bounds it by nothing useful, because the device does
@@ -420,6 +468,59 @@ class Microphone:
         # Index within the next block that continues the output sample grid.
         # See the class docstring: this is as load-bearing as `_zi`.
         self._phase = 0
+
+    @property
+    def device(self) -> int:
+        return self.selection.index
+
+    @property
+    def profile(self) -> MicProfile:
+        return self.selection.profile
+
+    def describe(self) -> dict:
+        """The microphone actually in use, for the settings page.
+
+        Everything here is read from the open stream's own `Selection` and from
+        the mixer itself — not from `AudioConfig`. A configured device name is
+        not an answer to "which microphone is AIA using": two USB capsules are
+        known to this project, either may be plugged in, the ALSA card number
+        moves on every re-plug, and `_restart` can swap the selection out from
+        under a running session.
+
+        Cached briefly because two of these fields cost an `amixer` subprocess
+        each, and a settings page that is left open should not spawn processes
+        on a timer.
+        """
+        with self._describe_lock:
+            now = time.monotonic()
+            if self._described is not None and now - self._described[0] < 5.0:
+                return self._described[1]
+
+            sel = self.selection
+            card = sel.card
+            info = {
+                "name": sel.name,
+                "profile": sel.profile.note or sel.profile.match,
+                "device_index": sel.index,
+                "alsa_card": card,
+                "card_description": (
+                    _live_cards().get(card) if card is not None else None),
+                "capture_rate": self.cfg.capture_rate,
+                "sample_rate": self.cfg.target_rate,
+                "channels": self.cfg.channels,
+                "sample_format": self.cfg.dtype,
+                "gain": "?" if card is None else _mixer_state(card),
+                "agc": "?" if card is None else _agc_state(card),
+                "configured_gain": sel.profile.gain,
+                "configured_agc": sel.profile.agc,
+                "streaming": self._stream is not None,
+                # A running total, not a rate. Non-zero means the gain is too
+                # high or the source too close, and it is the first thing to
+                # look at when utterances stop endpointing.
+                "clipped_samples": self._clipped_samples,
+            }
+            self._described = (now, info)
+            return info
 
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -574,8 +675,12 @@ class Microphone:
             # Re-selects rather than reopening the same index, so unplugging one
             # known microphone and plugging in another is recovered from here,
             # with the new capsule's own mixer settings applied.
-            self.device, self.profile = find_input_device(
+            self.selection = find_input_device(
                 self.cfg.microphones, allow_refresh=refresh, quiet=not first)
+            # Whatever the settings page last reported describes the previous
+            # capsule; it may not be this one.
+            with self._describe_lock:
+                self._described = None
             self.__enter__()
             self._reset_resampler()
             if self._restart_failures:
