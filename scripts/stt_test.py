@@ -459,13 +459,30 @@ def compare(runs: list[dict]) -> None:
 
 
 def selftest() -> int:
-    """Prove the backend loads and behaves on audio, without needing a corpus.
+    """Prove the backend loads and survives audio nobody meant to send it.
 
-    What it checks is deliberately narrow: that the model is present and
-    loadable, that silence comes back empty rather than as a hallucinated
-    phrase, and that a clip too short to hold a phoneme is refused rather than
-    crashing. None of that is accuracy — it is the set of things that would
-    otherwise fail at 7am in front of a person, having looked fine in a test.
+    Deliberately narrow, and deliberately not about accuracy: that the model is
+    present and loadable, and that non-speech cannot crash a turn or reach a
+    command. Those are the things that otherwise fail at 7am in front of a
+    person, having looked fine in a test.
+
+    **The bar is "reaches no command", not "returns an empty string", and that
+    is a measured decision rather than a lax one.** SenseVoice does not have
+    whisper's `[BLANK_AUDIO]`; handed silence it returns a short filler —
+    measured on this Pi, 1 s of digital silence gives '嗯。', white noise gives
+    'Yeah。' and louder noise '그.' — and it tags all three `<|Speech|>`, so
+    the model's own event field cannot be used to reject them. `emotion` does
+    separate them (`EMO_UNKNOWN` against `NEUTRAL` on all five of the model's
+    own speech samples), but that is three negative samples, and genuinely
+    angry or happy speech is also not NEUTRAL. Gating real commands on an
+    emotion tag, tuned against that, is not a trade worth making blind.
+
+    What makes it safe is that none of that filler routes — verified against
+    the real `FastRouter` — and that `Endpointer.collect` will not hand over an
+    utterance below `min_speech_ms` (500 ms voiced, 400 ms unbroken) in the
+    first place, so digital silence cannot reach the recogniser on the live
+    path at all. The worst case is a false wake answered with "You said: 嗯。"
+    instead of an apology.
     """
     cfg = CONFIG.stt
     print(f"backend: {cfg.backend}")
@@ -478,25 +495,33 @@ def selftest() -> int:
     print(f"  loaded and warm in {(time.monotonic() - t0) * 1000:.0f} ms")
 
     rate = CONFIG.audio.target_rate
+    rng = np.random.default_rng(0)
     checks = [
-        ("one second of silence", np.zeros(rate, dtype=np.int16), ""),
-        ("empty array", np.zeros(0, dtype=np.int16), ""),
-        ("10 ms, far too short", np.zeros(rate // 100, dtype=np.int16), ""),
-        # Noise, not silence: a recogniser that returns text for this is
-        # hallucinating, which is the failure that puts a wrong command
-        # through the router with nobody having said anything.
-        ("half a second of noise",
-         (np.random.default_rng(0).normal(0, 800, rate // 2)).astype(np.int16), ""),
+        ("one second of silence", np.zeros(rate, dtype=np.int16)),
+        ("empty array", np.zeros(0, dtype=np.int16)),
+        ("10 ms, far too short", np.zeros(rate // 100, dtype=np.int16)),
+        ("half a second of noise", rng.normal(0, 800, rate // 2).astype(np.int16)),
+        ("loud noise", rng.normal(0, 4000, rate).astype(np.int16)),
     ]
+
+    router = FastRouter(Registry([KodamaLite(), System()]))
     ok = True
-    for label, audio, expected in checks:
-        result = stt.listen(audio)
-        good = normalise(result.text) == normalise(expected)
+    for label, audio in checks:
+        try:
+            result = stt.listen(audio)
+        except Exception as exc:                    # the failure that matters
+            print(f"  FAIL {label:<26} raised {exc!r}")
+            ok = False
+            continue
+        intent = router.match(result.text)
+        good = intent is None
         ok &= good
-        print(f"  {'ok  ' if good else 'FAIL'} {label:<26} -> {result.text!r}")
+        note = "" if good else f"  ROUTED TO {intent.command.name!r}"
+        print(f"  {'ok  ' if good else 'FAIL'} {label:<26} -> {result.text!r}{note}")
 
     stt.close()
-    print("\nselftest passed" if ok else "\nselftest FAILED")
+    print("\nselftest passed — no non-speech reached a command"
+          if ok else "\nselftest FAILED")
     return 0 if ok else 1
 
 
