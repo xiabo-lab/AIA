@@ -110,9 +110,32 @@ STT is offline. That fetch is the only step that touches a network, it happens o
 nothing at runtime downloads anything or calls an API. A missing model stops AIA at startup
 with a line saying so, rather than falling back to something that would.
 
-whisper.cpp is kept as the fallback backend and still has the only measured accuracy record on
-real captures from this room. Switch with `stt.backend` in `aia/core/config.py`, or for one
-run:
+Measured against reference text, on 17 prompts read in this room through this microphone:
+
+| | SenseVoice | Whisper base |
+|---|---|---|
+| Mandarin CER | **0.05** | 0.48 |
+| Cantonese CER | **0.06** | 0.66 |
+| English CER | **0.10** | 0.19 |
+| Mixed zh/en CER | **0.12** | 0.38 |
+| exact transcripts | **11/17** | 3/17 |
+| mean / p95 latency | **150 / 202 ms** | 1112 / 1952 ms |
+| RTF | **0.06** | 0.45 |
+| CPU | **200%** of one core | 376% |
+| peak RSS | 603 MB | **262 MB** |
+
+Cantonese is the reason for the swap and the number that justifies it: **0.06 against 0.66**.
+Whisper does not fail on Cantonese so much as answer confidently in something else —
+播放陈奕迅嘅歌 came back as 播放陳玉順的歌. SenseVoice costs 341 MB more resident memory and
+is worth it.
+
+English is SenseVoice's weakest language, and the errors are not always harmless: it heard
+"search lyrics" as "Se lyrics." See the routing note under Commands for what that cost and how
+it is guarded.
+
+whisper.cpp is kept as the fallback backend behind the same interface. Switch with
+`stt.backend` in `aia/core/config.py`, or for one run — **both halves are needed**, since the
+unit is disabled and enabling it alone just burns 272 MB on a backend nothing is using:
 
 ```bash
 systemctl --user enable --now aia-whisper.service   # it needs its server
@@ -193,7 +216,34 @@ the 0.78 it needs to fire — so the separation does not rest on the threshold. 
 raised score floor for the two no-argument lyric commands, a rule that an argument which is
 itself a command is not an argument, and a bare trigger declining instead of guessing.
 
+`save lyric` carries a higher floor than the commands around it because it is the only one of
+the three that writes. SenseVoice heard "search lyrics" as "Se lyrics.", which scores 0.889
+against `save lyrics` and 0.800 against `search lyrics` — the dropped syllables leave the
+shared noun carrying the match. No scoring change separates those; the recogniser lost the
+information. So the write refuses anything below 0.90, and a near-miss is declined rather than
+guessed. Across 71 real captures every genuine save scores exactly 1.000.
+
 Destructive commands need an explicit yes on the following turn; anything ambiguous cancels.
+
+### What it says back — which is usually nothing
+
+Four commands answer out loud: **what's playing**, **shut down**, **reboot** and **close
+kodama**. Everything else acts in silence.
+
+That is deliberate. The result of "next" is a different song playing; the result of "volume
+fifty" is a different volume. Saying "下一首。" over the top of a track that has audibly
+already changed tells the room nothing it cannot hear, and it costs the tail of every turn —
+measured at 1250 ms of playback on a 3663 ms turn, during which the assistant is busy and the
+music stays ducked. Speech is kept for replies that carry information no other channel does:
+an answer to a question, and the three commands that take the screen away.
+
+Two things speak regardless. A command that **asks first** is answered out loud, because the
+question held the floor and going quiet at the most consequential moment is the wrong place to
+save a second. And a command that could not run at all — the player is closed — says so,
+because nothing changed on screen and silence there is indistinguishable from being ignored.
+
+Every reply still reaches the panel and the journal, spoken or not. `CommandSpec.speaks` is
+the whole mechanism; it defaults to False.
 
 ### Microphone level — check this before anything else
 
@@ -214,6 +264,37 @@ sudo alsactl store                             # or a reboot reverts both
 The symptoms in `journalctl --user -u aia` are `samples clipped at full scale` and
 `too hot to endpoint`. Two USB microphones also enumerate under the *same* name, differing
 only by a card number that moves on re-plug, so AIA warns when more than one input matches.
+
+### Sound output — install `pipewire-alsa` or AIA is mute
+
+```bash
+sudo apt install pipewire-alsa
+```
+
+AIA plays through PortAudio, which talks to ALSA. The Pi's only sink is HDMI and PipeWire owns
+it — and holds the ALSA device open for as long as anything is playing. Without the bridge,
+ALSA's `default` is simply busy whenever music is on: PortAudio enumerates **zero** output
+devices, `sd.default.device` is `-1`, and every reply is synthesised and dropped. The player
+keeps working the whole time, because it goes through PipeWire and never touches ALSA.
+
+This is worth stating loudly because of how it fails. Piper reports success, the log prints
+`tts[zh] 542 ms to audio: '正在搜索陈慧琳。'` for a reply nobody heard, and the only visible
+sign is one line above it:
+
+```
+ERROR aia.tts.piper  audio output unavailable, reply not spoken: Error querying device -1
+```
+
+`Speaker.warm()` now plays a short quiet tone at startup and says so either way, so a dead
+output is a boot-time error rather than something discovered days later by ear:
+
+```
+INFO  aia.tts.piper  audio output ready (158 ms for the probe tone)
+ERROR aia.tts.piper  AUDIO OUTPUT IS DEAD — every reply will be synthesised and never heard.
+```
+
+A failed probe does not stop the service. An assistant that hears and acts but cannot speak is
+degraded; one that refuses to start is useless.
 
 ### The wake word
 

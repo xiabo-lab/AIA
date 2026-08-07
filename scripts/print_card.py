@@ -75,6 +75,7 @@ td.zh   { width: 39%; }
 .alt { color: #444; }
 .arg { font-style: italic; }
 .note { font-size: 8.5pt; color: #222; margin: 1.5mm 0 0; }
+.spk { font-weight: 400; font-size: 7.5pt; }
 .foot {
   margin-top: 5mm; padding-top: 2.5mm; border-top: 1pt solid #000;
   font-size: 8.5pt; page-break-inside: avoid;
@@ -125,6 +126,11 @@ def main() -> int:
             label = html.escape(command.description)
             if command.params:
                 label += " <span class='arg'>…</span>"
+            # Marked, because "did it hear me?" is the question a silent
+            # assistant provokes, and the card is what somebody has in their
+            # hand when they ask it.
+            if command.speaks:
+                label += "<sup class='spk'>†</sup>"
             rows.append(
                 f"<tr><td class='does'>{label}</td>"
                 f"<td class='en'>{phrases_html(command, 'en')}</td>"
@@ -149,8 +155,11 @@ def main() -> int:
 search. It runs to the end of the sentence. <b>N</b> is a number 0–100;
 “fifty percent”, “五十” and “百分之五十” all work.</p>
 <p class="note">Phrases are matched by <b>sound, not spelling</b>, so they do
-not have to be said exactly. Anything not recognised as a command is repeated
-back to you.</p>
+not have to be said exactly. Anything not recognised as a command is shown on
+screen rather than read back.</p>
+<p class="note"><b>†</b> AIA answers these out loud. Everything else it simply
+does — you can see or hear the result already — so it acts without saying
+anything. A command that asks first always speaks.</p>
 <div class="foot">
   <b>Commands that ask first</b> say what they are about to do and keep
   listening — you do not need the wake word again to answer.
