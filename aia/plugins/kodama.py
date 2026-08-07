@@ -439,6 +439,21 @@ class KodamaLite(Plugin):
             return self._control_failed(failed)
         return Result.done("Karaoke mode.", "卡拉OK模式。")
 
+    def karaoke_exit(self) -> Result:
+        """Leave karaoke, as its own command rather than a toggle.
+
+        `karaoke` with no argument toggles, which is the wrong shape for a
+        person who can see the screen: if the room is already looking at the
+        karaoke stage then "exit karaoke" must close it, and a toggle would
+        open it again for anyone who said it twice or was misheard once.
+        `off` is one of the words the view's `parseSwitch` accepts, so this
+        needs nothing new from the player.
+        """
+        failed = self._control("karaoke", "off")
+        if failed:
+            return self._control_failed(failed)
+        return Result.done("Leaving karaoke.", "已退出卡拉OK。")
+
     def quit_app(self) -> Result:
         failed = self._control("quit")
         if failed:
@@ -654,6 +669,24 @@ class KodamaLite(Plugin):
                 phrases={
                     "en": ("karaoke", "karaoke mode", "full screen lyrics"),
                     "zh": ("卡拉OK", "卡拉OK模式", "全屏歌词", "开启卡拉OK"),
+                },
+            ),
+            # Every phrase here contains the whole of a `karaoke` phrase —
+            # 退出卡拉OK holds 卡拉OK — so these two are a near-twin pair of
+            # the kind that has bitten this file before. They stay apart on
+            # length: 退出卡拉ok against 卡拉ok scores 0.71 in the pinyin the
+            # router compares, under the 0.78 it needs, while each exact
+            # phrase scores 1.00 against its own command. Checked, not
+            # assumed — see tests/test_new_commands.py.
+            CommandSpec(
+                name="karaoke_exit", description="Leave full-screen karaoke",
+                handler=self.karaoke_exit,
+                phrases={
+                    "en": ("exit karaoke", "close karaoke", "leave karaoke",
+                           "exit karaoke mode", "quit karaoke",
+                           "close full screen lyrics"),
+                    "zh": ("退出卡拉OK", "关闭卡拉OK", "退出卡拉OK模式",
+                           "关掉卡拉OK", "退出全屏歌词", "关闭全屏歌词"),
                 },
             ),
             CommandSpec(

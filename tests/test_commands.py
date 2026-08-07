@@ -15,9 +15,9 @@ from aia.plugins.kodama import KodamaLite
 from aia.plugins.system import System
 
 # Every command whose reply is spoken aloud, and nothing else. `now_playing`
-# answers a question — the answer exists nowhere but in the reply. The other
-# three take the screen away, so there is nothing left to look at.
-SPEAKING = {"now_playing", "shutdown", "reboot", "quit"}
+# and `network` answer questions — the answer exists nowhere but in the reply.
+# The other three take the screen away, so there is nothing left to look at.
+SPEAKING = {"now_playing", "network", "shutdown", "reboot", "quit"}
 
 
 def registry() -> Registry:
