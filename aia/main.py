@@ -396,6 +396,10 @@ def main() -> int:
                     intent = router.match(text)
                     turn.mark("routed")
 
+                    # Silence is the default; each branch below opts in. See
+                    # `CommandSpec.speaks` for why round it that way.
+                    speak = False
+
                     if intent is not None and intent.command.confirm:
                         # Destructive: ask, then KEEP THE FLOOR and listen for the
                         # answer in this same turn. Asking and then returning to
@@ -431,6 +435,13 @@ def main() -> int:
                         else:
                             log.info("no answer to the confirmation")
 
+                        # Anything that got as far as being asked about out loud
+                        # is answered out loud, whichever way it went. The
+                        # question held the floor and the room is waiting on it;
+                        # going silent after "关闭树莓派。确定吗？" would leave
+                        # the most consequential moment in the whole interaction
+                        # as the only one with no audible outcome.
+                        speak = True
                         if decision is True:
                             machine.to(State.ACTING)
                             reply = intent.command.handler(**intent.arguments).say(lang)
@@ -447,9 +458,16 @@ def main() -> int:
                                 f"{intent.plugin.description} is not currently running.",
                                 f"{intent.plugin.description} 没有在运行。",
                             ).say(lang)
+                            # A command that did not run is not a command whose
+                            # result can be seen. Nothing changed on screen, so
+                            # this is spoken even when the command itself is a
+                            # quiet one — otherwise asking a closed app to skip
+                            # a track is indistinguishable from being ignored.
+                            speak = True
                         else:
                             outcome = intent.command.handler(**intent.arguments)
                             reply = outcome.say(lang)
+                            speak = intent.command.speaks
                         turn.mark("acted")
                     else:
                         # No known command. M2 puts the LLM here; until then, say
@@ -461,16 +479,27 @@ def main() -> int:
                     # On screen first, then spoken. Writing text costs under a
                     # millisecond while synthesis costs a few hundred, so showing
                     # it first means the reply appears as the voice starts rather
-                    # than after it.
+                    # than after it. The panel gets every reply, spoken or not —
+                    # it is the channel that never goes quiet.
                     panel.aia(reply, lang)
                     # Mark when audio STARTS, not when it finishes. Timing a
                     # blocking play charges the whole spoken reply to the turn —
                     # a two-second sentence looked like two seconds of latency,
                     # which made a responsive turn read as 4 s over budget. What
                     # the user experiences is the wait before hearing anything.
-                    speaker.say(reply, lang, blocking=False)
-                    turn.mark("audio_out")
-                    speaker.wait()
+                    #
+                    # Marked either way, so a silent turn and a spoken one stay
+                    # comparable in the journal rather than the field simply
+                    # vanishing from half of them.
+                    if speak:
+                        speaker.say(reply, lang, blocking=False)
+                        turn.mark("audio_out")
+                        speaker.wait()
+                    else:
+                        turn.mark("audio_out")
+                        log.info("reply not spoken (%s): %r",
+                                 f"{intent.plugin.name}.{intent.command.name}"
+                                 if intent is not None else "no command", reply)
 
                 except Exception:
                     log.exception("turn failed")

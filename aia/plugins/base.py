@@ -62,6 +62,23 @@ class CommandSpec:
     # was asked for, so these opt out of the restore.
     stops_playback: bool = False
 
+    # Whether the reply is spoken. Off by default, which is the unusual choice
+    # and the deliberate one.
+    #
+    # Nearly every command here has a visible result: the music changes, the
+    # window changes, the volume changes. Saying "下一首。" over the top of a
+    # track that has audibly already changed tells the room nothing it cannot
+    # see and hear, and it costs the tail of every turn — measured at 1250 ms
+    # of `speaker.wait()` on a 3663 ms turn, during which the assistant is
+    # busy and the music stays ducked.
+    #
+    # So speech is reserved for replies that carry information no other
+    # channel does: an answer to a question (`now_playing`), and the acts with
+    # no visible result to watch because the screen is about to go away
+    # (`shutdown`, `reboot`, `quit`). Everything else acts silently and writes
+    # to the panel, which is instant and does not hold the floor.
+    speaks: bool = False
+
     def describe(self, language: str) -> str:
         return self.speech.get(language) or self.description
 

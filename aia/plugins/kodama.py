@@ -416,7 +416,7 @@ class KodamaLite(Plugin):
             ),
             CommandSpec(
                 name="now_playing", description="Say what is currently playing",
-                handler=self.now_playing,
+                handler=self.now_playing, speaks=True,
                 phrases={
                     "en": ("what's playing", "what is playing", "what song is this",
                            "now playing", "what's this song"),
@@ -521,10 +521,34 @@ class KodamaLite(Plugin):
                            "重新搜索歌词", "搜一下歌词"),
                 },
             ),
+            # `save_lyrics` sits higher than its neighbours because it is the
+            # only one of the three that *writes*. Measured on this device:
+            # SenseVoice heard "search lyrics" as "Se lyrics.", which scores
+            # 0.889 against `save lyrics` and only 0.800 against `search
+            # lyrics` — the dropped syllables leave the shared noun carrying
+            # the match, and "se" is genuinely closer to "save" than to
+            # "search". So a request to read was one floor away from writing
+            # to the lyrics cache.
+            #
+            # No scoring change separates the two. Comparing verbs alone is
+            # worse, not better: "se" vs "save" is 0.667 while the correctly
+            # intended "say" vs "save" is 0.571, so the wrong reading wins
+            # there too. The scores simply overlap, because the recogniser —
+            # not the router — lost the information.
+            #
+            # 0.90 is derived from the corpus rather than picked: across 71
+            # real captures every genuine save scores exactly 1.000 (9 of
+            # them), and the highest any non-save utterance reaches against
+            # this command is 0.889. Any floor in between refuses the
+            # near-miss; 0.90 is the round number with the most headroom.
+            # The cost is measured too, and it is one capture: a degraded
+            # "Say the lyrics." at 0.880 is now declined rather than obeyed.
+            # That is the intended direction — an unwanted write is worse
+            # than being asked to repeat yourself.
             CommandSpec(
                 name="save_lyrics",
                 description="Save the current lyrics to the lyrics cache",
-                handler=self.save_lyrics, min_score=0.85,
+                handler=self.save_lyrics, min_score=0.90,
                 phrases={
                     "en": ("save lyric", "save lyrics", "save the lyrics",
                            "save these lyrics", "keep these lyrics",
@@ -555,7 +579,7 @@ class KodamaLite(Plugin):
             ),
             CommandSpec(
                 name="quit", description="Close Kodama-Lite", handler=self.quit_app,
-                confirm=True, stops_playback=True,
+                confirm=True, stops_playback=True, speaks=True,
                 speech={"en": "close Kodama-Lite", "zh": "关闭音乐播放器"},
                 phrases={
                     "en": ("close kodama", "quit kodama", "exit kodama",

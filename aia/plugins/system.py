@@ -105,7 +105,7 @@ class System(Plugin):
         return [
             CommandSpec(
                 name="shutdown", description="Power off the Raspberry Pi",
-                handler=self.shutdown, confirm=True, stops_playback=True,
+                handler=self.shutdown, confirm=True, stops_playback=True, speaks=True,
                 speech={"en": "power off the Raspberry Pi", "zh": "关闭树莓派"},
                 phrases={
                     "en": ("shut down", "shutdown", "power off", "turn off the pi",
@@ -115,7 +115,7 @@ class System(Plugin):
             ),
             CommandSpec(
                 name="reboot", description="Restart the Raspberry Pi",
-                handler=self.reboot, confirm=True, stops_playback=True,
+                handler=self.reboot, confirm=True, stops_playback=True, speaks=True,
                 speech={"en": "restart the Raspberry Pi", "zh": "重启树莓派"},
                 phrases={
                     "en": ("reboot", "restart the pi", "reboot the pi"),
