@@ -86,8 +86,30 @@ class AudioConfig:
         # threshold compared against wideband RMS. And it advertises internal
         # noise reduction, which is level-dependent processing of the same
         # family as the AGC that caused the saturation incident.
-        MicProfile(match="USB Microphone", gain=16, agc=False,
-                   note="Generalplus, omnidirectional (16/30 = 12.00 dB)"),
+        #
+        # **12.00 dB was too hot and the endpointer paid for it.** Over 78 real
+        # captures at gain 16: 28% ran to the 10 s cap, 31% peaked at or above
+        # −1 dBFS, and 28% contained clipped samples. Near full scale webrtcvad
+        # calls every frame speech, `silence_ms` is never satisfied, and the
+        # utterance can only end at `max_utterance_ms` — so more than a quarter
+        # of everything said to this assistant took ten seconds to be heard,
+        # whatever it was. Worst outdoors, where people speak closer and the
+        # room is louder, but present everywhere: the capped captures span the
+        # whole day, not one session.
+        #
+        # This scale is 0-30 spanning −12.00 to +33.00 dB, so 1.5 dB a step.
+        # Step 8 is 0.00 dB, which is 12 dB of headroom against a distribution
+        # whose p90 peak was −0.0 dBFS. Chosen to move the loud tail clear of
+        # the rail rather than to centre the quiet one, because saturation
+        # costs a whole turn while a quiet capture costs nothing measurable —
+        # the speech-band SNR here is 45 dB and SenseVoice normalises.
+        #
+        # The thing to watch is the other end: the p10 peak was −19.4 dBFS and
+        # is now around −31, and no distance test has ever been run on this
+        # capsule. If wake detection falls off across the room, that is where
+        # it will show, and step 12 (6.00 dB) is the halfway house.
+        MicProfile(match="USB Microphone", gain=8, agc=False,
+                   note="Generalplus, omnidirectional (8/30 = 0.00 dB)"),
         # TI PCM2902. Every recognition threshold in this project was tuned
         # against this capsule, so it stays as the fallback. 8/16 is the value
         # the audio review settled on; 16/16 is what caused the clipping.
