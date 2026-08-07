@@ -245,7 +245,9 @@ def main() -> int:
     panel = Panel(enabled=os.environ.get("AIA_NO_PANEL") != "1", history=history)
 
     registry = Registry([KodamaLite(), System()])
-    router = FastRouter(registry)
+    # The wake forms are handed to the router as sentence boundaries, not for
+    # detection — a transcript containing one in the middle is two requests.
+    router = FastRouter(registry, wake_words=cfg.wake.variants)
     # Language of the last thing heard, so "Listening…" appears in whichever
     # language the user is already speaking rather than defaulting to English.
     stt_language = cfg.stt.default_language
@@ -393,7 +395,12 @@ def main() -> int:
                     # visible rather than something to infer from a wrong action.
                     panel.user(text, lang)
 
-                    intent = router.match(text)
+                    # One utterance can hold more than one command. `intent`
+                    # stays the *last* of them, because everything downstream
+                    # — the reply, whether it is spoken, whether the music is
+                    # restored — is a question about how the turn ended.
+                    chain = router.match_sequence(text)
+                    intent = chain[-1] if chain else None
                     turn.mark("routed")
 
                     # Silence is the default; each branch below opts in. See
@@ -453,10 +460,15 @@ def main() -> int:
                             reply = "Cancelled." if lang == "en" else "已取消。"
                     elif intent is not None:
                         machine.to(State.ACTING)
-                        if not intent.plugin.available():
+                        # Asked of every command in the chain before any of
+                        # them runs, so a two-command utterance cannot half
+                        # succeed against an app that is closed.
+                        missing = next(
+                            (s for s in chain if not s.plugin.available()), None)
+                        if missing is not None:
                             reply = Result.failed(
-                                f"{intent.plugin.description} is not currently running.",
-                                f"{intent.plugin.description} 没有在运行。",
+                                f"{missing.plugin.description} is not currently running.",
+                                f"{missing.plugin.description} 没有在运行。",
                             ).say(lang)
                             # A command that did not run is not a command whose
                             # result can be seen. Nothing changed on screen, so
@@ -465,8 +477,14 @@ def main() -> int:
                             # a track is indistinguishable from being ignored.
                             speak = True
                         else:
-                            outcome = intent.command.handler(**intent.arguments)
-                            reply = outcome.say(lang)
+                            # Every command in the utterance, in order. Only
+                            # the last one's reply is kept and only its flag
+                            # decides speech — a chain that announced each
+                            # step would be slower and more talkative than
+                            # the two separate turns it replaced.
+                            for step in chain:
+                                outcome = step.command.handler(**step.arguments)
+                                reply = outcome.say(lang)
                             speak = intent.command.speaks
                         turn.mark("acted")
                     else:

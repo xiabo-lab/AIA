@@ -62,6 +62,27 @@ BARE_TRIGGER = 0.95
 # Punctuation Whisper likes to add, which no spoken phrase contains.
 _STRIP = re.compile(r"[\s,.!?;:'\"，。！？、；：…—\-]+")
 
+# Where one command can end and another begin inside a single transcript.
+#
+# Explicit joining words only. Not silence, not word boundaries, not 和 —
+# which is a conjunction in the language and also a syllable in names, and
+# splitting "播放周杰伦和五月天" would turn one search into two wrong ones.
+# Every separator here is something a person says *between* two requests.
+# The Latin words are bounded by "not a Latin letter" rather than by `\b`,
+# which does not work here: Han characters are word characters to `re`, so
+# there is no word boundary in "下一首and现在播放什么" and `\band\b` never
+# fires on the one transcript this was built for. Bounded, though — "band"
+# and "Sandy" must not be split down the middle.
+_CONNECTIVES = re.compile(
+    r"(?:(?<![a-zA-Z])(?:and|then|also)(?![a-zA-Z])|然后|接着|还有|、|，|,)",
+    re.IGNORECASE,
+)
+
+# At most this many commands from one breath. Two is the observed case and
+# three is generous; beyond that the transcript is far more likely to be a
+# sentence full of connectives than a genuine list of commands.
+MAX_CHAIN = 3
+
 try:
     from pypinyin import lazy_pinyin
 
@@ -118,8 +139,14 @@ class FastRouter:
     """
 
     def __init__(self, registry: Registry, threshold: float = 0.78,
-                 argument_threshold: float = 0.82):
+                 argument_threshold: float = 0.82,
+                 wake_words: tuple[str, ...] = ()):
         self.registry = registry
+        # A wake phrase in the *middle* of a transcript is a boundary: the
+        # speaker asked for one thing and then summoned the assistant again
+        # for another, in one breath. Passed in rather than read from config,
+        # so this module keeps knowing only about the registry.
+        self.wake_words = tuple(w for w in wake_words if w)
         # Whole-utterance commands ("暂停") are matched end to end, so a loose
         # threshold risks firing on unrelated speech.
         self.threshold = threshold
@@ -131,6 +158,79 @@ class FastRouter:
         self._whole_cache: list[str] | None = None
         self._whole_lengths: list[int] = []
         self._trigger_cache: list[str] | None = None
+
+    def match_sequence(self, text: str) -> list[Intent]:
+        """Every command in one utterance, in the order they were said.
+
+        People say two things in one breath — "下一首 and 现在播放什么", or
+        "暂停小爱同学搜索歌", where the wake word arrives mid-sentence because
+        they summoned the assistant again without waiting. Both were captured
+        from real use. `match` scores the transcript as a whole, so a
+        transcript holding two commands looks like neither and is declined.
+
+        **The whole utterance is always tried first, and a match there ends
+        it.** That is what makes this safe rather than clever: nothing that
+        routes today can start routing differently, because splitting is only
+        reached when the router had already given up. It also protects the
+        commands that take an argument — a slot runs to the end of the
+        utterance, so "播放五月天和陈奕迅" must stay one search for one query
+        and not become two.
+
+        Returns [] where `match` returned None, so a caller that only wants
+        one command can keep asking for one.
+        """
+        whole = self.match(text)
+        if whole is not None:
+            return [whole]
+
+        segments = self._segments(text)
+        if len(segments) < 2:
+            return []
+        if len(segments) > MAX_CHAIN:
+            log.debug("%r splits into %d segments; too many to be a command "
+                      "list", text, len(segments))
+            return []
+
+        found: list[Intent] = []
+        for segment in segments:
+            intent = self.match(segment)
+            if intent is None:
+                # All or nothing. Half of a garbled sentence is a command
+                # nobody asked for, and the whole point of declining is that
+                # the assistant does not guess — running the part it
+                # recognised would be guessing about the rest.
+                log.debug("segment %r of %r does not route; declining the "
+                          "whole utterance", segment, text)
+                return []
+            if intent.command.confirm:
+                # A destructive command must arrive as its own request, out
+                # loud, and be confirmed on its own. Reaching one as the tail
+                # of a longer sentence is exactly how "关机" ends up running
+                # because it was mentioned rather than asked for.
+                log.warning("%r contains %s, which needs confirming on its "
+                            "own — declining the whole utterance",
+                            text, intent.command.name)
+                return []
+            found.append(intent)
+
+        log.info("fast path: %d commands in one utterance — %s",
+                 len(found), ", ".join(i.command.name for i in found))
+        return found
+
+    def _segments(self, text: str) -> list[str]:
+        """Split a transcript where one request visibly ends and another starts.
+
+        Wake words first, then connectives, because a wake word is the
+        stronger signal and can sit next to a connective ("暂停，小爱同学，
+        下一首") without either being lost.
+        """
+        parts = [text]
+        for separator in self.wake_words:
+            parts = [bit for part in parts for bit in part.split(separator)]
+        parts = [bit for part in parts for bit in _CONNECTIVES.split(part)]
+        # A separator at either end leaves an empty string, and a transcript
+        # that is nothing but punctuation leaves only empties.
+        return [bit.strip() for bit in parts if bit and bit.strip()]
 
     def match(self, text: str) -> Intent | None:
         """The best command this utterance matches, or None.

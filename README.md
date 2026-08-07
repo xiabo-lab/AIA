@@ -225,6 +225,26 @@ guessed. Across 71 real captures every genuine save scores exactly 1.000.
 
 Destructive commands need an explicit yes on the following turn; anything ambiguous cancels.
 
+### Two commands in one breath
+
+"下一首 and 现在播放什么" runs both, in order. So does "暂停小爱同学下一首", where the wake
+word arrives mid-sentence because the assistant was summoned again without waiting. Both shapes
+were captured from real use, and both used to route to nothing at all — the router scores the
+transcript as a whole, so a transcript holding two commands looks like neither.
+
+**The whole utterance is always tried first and a match there ends it.** Splitting is only
+reached when the router had already declined, which is what keeps it safe: nothing that routes
+today can start routing differently, and an argument that runs to the end of the utterance
+stays intact — 播放五月天和陈奕迅 is one search for one query, not two wrong ones. Verified
+across 76 real captures: exactly two verdicts change, and they are the two utterances above.
+
+Splitting happens on explicit joining words only — `and`, `then`, `also`, 然后, 接着, 还有, and
+commas — plus a wake word in the middle. Not on 和, which is a conjunction in the language and
+also a syllable in names. Three commands is the limit, every segment must route or the whole
+utterance is declined, and anything needing confirmation is refused inside a chain: 关机 has to
+be asked for on its own rather than reached as the tail of a sentence. Only the last reply is
+spoken.
+
 ### What it says back — which is usually nothing
 
 Four commands answer out loud: **what's playing**, **shut down**, **reboot** and **close
