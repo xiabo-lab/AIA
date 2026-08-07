@@ -44,6 +44,67 @@ log = logging.getLogger(__name__)
 # user. See `publish_control_endpoint` in its playback/server.rs.
 CONTROL_STATE = Path.home() / ".local/state/kodama-lite/control.json"
 
+# 【…】 and […] hold blurb in upload titles — a line of the lyrics, a promo
+# tag — never the song. Round brackets are left alone: "(Live)" and "（R&B版）"
+# are part of what the track is.
+_TITLE_BLURB = re.compile(r"[【\[][^】\]]*[】\]]")
+
+# Everything from the first "and here is some more about this upload" bar
+# onwards. These are metadata separators in upload titles and are not used
+# inside a song name — unlike the hyphen, which is, so it is deliberately not
+# here. `/` only counts when spaced: "R&B/Lo-fi" is one tag, "Song / Artist"
+# is two fields.
+_TITLE_TAIL = re.compile(r"\s*(?:[｜|·・]|(?<=\s)/(?=\s))\s*.*$", re.DOTALL)
+
+# Decoration people put in upload titles. Says nothing out loud.
+_TITLE_DECORATION = "♫♪♬★☆✧✿❤～~-—–·、,，.。 \t"
+
+# Brackets that must not be left hanging open by a cut.
+_BRACKETS = {"《": "》", "（": "）", "(": ")", "【": "】", "[": "]",
+             "「": "」", "“": "”", '"': '"'}
+
+# How much of a title is worth saying out loud — roughly two seconds of speech
+# in either language.
+TITLE_LIMIT = 24
+
+
+def _drop_unclosed(text: str) -> str:
+    """Cut back to before any bracket left hanging open.
+
+    Trimming by length cuts wherever the limit lands, and the first real title
+    this met — `K.D 翻唱《不如》【不如我們擁抱後分手，不如眼淚有空偷偷流...】♫`
+    — came back as `K.D 翻唱《不如》【不如我們擁抱後分手`, which reads aloud as
+    a sentence that opens something and never closes it.
+    """
+    for opener, closer in _BRACKETS.items():
+        at = text.rfind(opener)
+        if at != -1 and text.find(closer, at + 1) == -1:
+            text = text[:at]
+    return text.strip(_TITLE_DECORATION)
+
+
+def _short_title(title: str) -> str:
+    """A track title trimmed to something worth hearing.
+
+    Not for display — the panel and the player still show the real thing.
+    This is only for the one command that reads a title aloud.
+    """
+    short = _TITLE_BLURB.sub("", title)
+    short = _TITLE_TAIL.sub("", short).strip(_TITLE_DECORATION)
+    short = short or title.strip(_TITLE_DECORATION) or title.strip()
+
+    if len(short) > TITLE_LIMIT:
+        head = short[:TITLE_LIMIT]
+        for separator in ("-", "–", "—", "，", ",", "(", "（", " "):
+            cut = head.rfind(separator)
+            if cut >= TITLE_LIMIT // 2:
+                head = head[:cut]
+                break
+        short = head.strip(_TITLE_DECORATION)
+
+    return _drop_unclosed(short) or short
+
+
 # Spoken numbers. Whisper usually returns digits ("音量调到50%") but not
 # always, and a Chinese numeral is the natural way to say it.
 _CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
@@ -261,13 +322,31 @@ class KodamaLite(Plugin):
         return Result.done("Stopped.", "已停止。") if ok else self._unavailable()
 
     def now_playing(self) -> Result:
+        """What is playing, short enough to be worth listening to.
+
+        This is one of only four commands that speaks, so the reply is the
+        whole point of it — and the titles this library actually holds are
+        upload titles, not catalogue entries. Measured on the device:
+
+            《單車》陳奕迅｜Cover by CCG｜Acoustic R&B / Lo-fi
+            年轮（R&B版）-陶宏杰   + artist "zuoo Chinese"
+
+        Read aloud, the first took 3.3 s of a 7.4 s turn. Everything after
+        that first bar is production credits and genre tags — true, and not
+        what anybody asked.
+        """
         ok, title = self._run("metadata", "xesam:title")
         if not ok:
             return self._unavailable()
         if not title:
             return Result.done("Nothing is playing.", "现在没有播放。")
+        title = _short_title(title)
         _, artist = self._run("metadata", "xesam:artist")
-        if artist:
+        # The artist field on these is the channel that uploaded it, which is
+        # either already in the title ("年轮（R&B版）-陶宏杰") or noise
+        # ("zuoo Chinese"). Only worth saying when it adds something.
+        if artist and _short_title(artist) not in title:
+            artist = _short_title(artist)
             return Result.done(f"{title}, by {artist}.", f"{title}，{artist}。")
         return Result.done(f"{title}.", f"{title}。")
 

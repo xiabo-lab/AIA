@@ -25,6 +25,11 @@ class State(Enum):
     ERROR = "error"
 
 
+# The mark that decides whether a turn was fast enough. Set by `main.py` the
+# moment audio starts, not when it finishes.
+VERDICT_MARK = "audio_out"
+
+
 @dataclass
 class Turn:
     """Timings for one wake-to-reply cycle, in milliseconds from the wake word."""
@@ -39,11 +44,44 @@ class Turn:
     def total_ms(self) -> float:
         return (time.monotonic() - self.started) * 1000
 
-    def report(self, budget_ms: int) -> str:
+    def judged_ms(self, total: float | None = None) -> float:
+        """The elapsed time the budget is actually about.
+
+        Not the total. A turn does not end when the assistant stops being
+        slow, it ends when it stops talking, and reading a reply aloud is not
+        latency — it is the answer arriving. `main.py` marks `audio_out`
+        before `speaker.wait()` for exactly this reason, with a comment
+        saying so, and then this class spent every spoken turn comparing the
+        total against the budget anyway. A 545 ms reply to a track title that
+        takes three seconds to say was logged `OVER by 4938ms`.
+
+        What the user experiences as slowness is the wait before hearing
+        anything, so that is what is judged. Turns that never reach
+        `audio_out` — an empty transcript, a turn that died — have nothing
+        better to offer than the total.
+        """
+        if total is None:
+            total = self.total_ms
+        return self.marks.get(VERDICT_MARK, total)
+
+    def report(self, budget_ms: int) -> tuple[str, bool]:
+        """The log line, and whether it broke the budget.
+
+        Both together because they are one judgement made from one reading of
+        the clock. Asking separately meant `report()` and the caller each
+        called `total_ms`, so the line printed one number and the decision to
+        warn about it used another.
+        """
         parts = " ".join(f"{k}={v:.0f}" for k, v in self.marks.items())
         total = self.total_ms
-        verdict = "OK" if total <= budget_ms else f"OVER by {total - budget_ms:.0f}ms"
-        return f"turn {total:.0f}ms [{verdict}] {parts}"
+        judged = self.judged_ms(total)
+        over = judged > budget_ms
+        verdict = f"OVER by {judged - budget_ms:.0f}ms" if over else "OK"
+        # The total is still shown. It is the wrong thing to judge and the
+        # right thing to be able to see — a turn that answered in 400 ms and
+        # then talked for nine seconds is worth noticing, just not as a
+        # latency failure.
+        return f"turn {judged:.0f}ms to audio [{verdict}] of {total:.0f}ms total · {parts}", over
 
 
 class Machine:
@@ -83,8 +121,8 @@ class Machine:
 
     def end_turn(self) -> None:
         if self.turn is not None:
-            report = self.turn.report(self.budget_ms)
-            if self.turn.total_ms > self.budget_ms:
+            report, over = self.turn.report(self.budget_ms)
+            if over:
                 log.warning(report)
             else:
                 log.info(report)
