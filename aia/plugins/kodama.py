@@ -454,6 +454,34 @@ class KodamaLite(Plugin):
             return self._control_failed(failed)
         return Result.done("Leaving karaoke.", "已退出卡拉OK。")
 
+    def home(self) -> Result:
+        failed = self._control("home")
+        if failed:
+            return self._control_failed(failed)
+        return Result.done("Home.", "已回到主页。")
+
+    def play_local(self) -> Result:
+        """Play the USB stick.
+
+        `播放本地音乐` and `播放USB歌曲` are one command because they are one
+        thing on this device: Kodama-Lite's only offline library is the
+        Library's Local tab, which is the removable drive. Its audio cache
+        holds every track already played and is an inventory rather than a
+        browsable list, so there is nothing else "local music" could mean.
+        Carrying two commands to the same action would put two rows on the
+        printed card for one behaviour.
+        """
+        failed = self._control("play_local")
+        if failed:
+            return self._control_failed(failed)
+        return Result.done("Playing from USB.", "正在播放U盘里的音乐。")
+
+    def play_liked(self) -> Result:
+        failed = self._control("play_liked")
+        if failed:
+            return self._control_failed(failed)
+        return Result.done("Playing your liked songs.", "正在播放你喜欢的歌曲。")
+
     def quit_app(self) -> Result:
         failed = self._control("quit")
         if failed:
@@ -661,6 +689,51 @@ class KodamaLite(Plugin):
                     "zh": ("搜索歌曲{query}", "搜寻歌曲{query}",
                            "查找歌曲{query}", "找歌曲{query}",
                            "搜索一下歌曲{query}"),
+                },
+            ),
+            # Needs Kodama-Lite 0.1.42. Against anything older the control
+            # endpoint answers 400 and the assistant says so out loud rather
+            # than claiming success — see `_control`.
+            CommandSpec(
+                name="home", description="Go back to the home screen",
+                handler=self.home,
+                phrases={
+                    "en": ("go home", "back to home", "home screen",
+                           "go to the home page", "take me home"),
+                    "zh": ("回到主页", "返回主页", "回主页", "回到首页",
+                           "返回首页", "主页"),
+                },
+            ),
+            # Every phrase here starts with 播放, which is also `play`'s
+            # trigger — so "播放本地音乐" is simultaneously an exact
+            # whole-utterance match for this and an exact trigger match for
+            # `play` with the argument "本地音乐". The router's tie-break
+            # settles it: at equal score a command that consumed the whole
+            # utterance beats one that matched a two-syllable trigger and
+            # invented an argument from the rest. Same rule that keeps
+            # "播放歌曲" out of the search. Verified, not assumed.
+            CommandSpec(
+                name="play_local", description="Play the music on the USB drive",
+                handler=self.play_local,
+                phrases={
+                    "en": ("play local music", "play from usb", "play usb music",
+                           "play the usb songs", "play local songs",
+                           "play music from usb"),
+                    "zh": ("播放本地音乐", "播放本地歌曲", "播放USB歌曲",
+                           "播放U盘的歌", "播放U盘音乐", "播放优盘的歌",
+                           "播放本地的歌"),
+                },
+            ),
+            CommandSpec(
+                name="play_liked", description="Play your liked songs",
+                handler=self.play_liked,
+                phrases={
+                    "en": ("play my liked songs", "play liked music",
+                           "play my favourites", "play my favorites",
+                           "play the songs i like"),
+                    "zh": ("播放我喜欢的歌曲", "播放我喜欢的歌",
+                           "播放收藏的歌曲", "播放我的收藏",
+                           "播放喜欢的音乐"),
                 },
             ),
             CommandSpec(
