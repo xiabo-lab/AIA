@@ -337,7 +337,11 @@ def main() -> int:
                 # syllable of "小艾同学播放五月天" said in one breath, which works
                 # today, so it is done only when it buys something.
                 if ducker.duck():
-                    mic.drain()
+                    # ...but keep the newest `preroll_ms`, which is the part
+                    # that is not music: it is the syllable the user is saying
+                    # right now. The music is in the older audio, and that is
+                    # what this is here to throw away.
+                    mic.drain(keep_ms=cfg.vad.preroll_ms)
 
                 # Shown before anything is transcribed, because the question the
                 # user actually has at this moment is "did it hear me at all?".

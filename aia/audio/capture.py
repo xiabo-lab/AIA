@@ -769,20 +769,53 @@ class Microphone:
                 yield residual[:n]
                 residual = residual[n:]
 
-    def drain(self) -> None:
+    def drain(self, keep_ms: int = 0) -> None:
         """Discard buffered audio and reset the drop counter.
 
         Called after speaking, so the assistant does not immediately transcribe
         its own reply leaking back through the microphone — and so the next
         turn starts from live audio rather than working through a backlog of
         whatever accumulated while it was busy.
+
+        `keep_ms` holds back the most recent audio instead of taking all of it.
+        The drain on the wake word (see `main`) is protecting the endpointer
+        from music sitting in the pre-roll, and the oldest audio is where that
+        music is — the newest is whatever the user is saying *now*, which is
+        the opening syllable of a command given in one breath. Zero, the
+        default, is the after-speaking case, where everything buffered is the
+        assistant's own voice and none of it is worth keeping.
+
+        How much this actually discards was a `log.debug` nobody reads, which
+        left "the drain is eating the command" as a theory that could be argued
+        either way. In steady state the wake loop consumes every frame and the
+        queue is near-empty, so the honest expectation is that this is close to
+        a no-op and only bites when the consumer has fallen behind. Now it says
+        so when it is not.
         """
+        keep_samples = int(keep_ms * self.cfg.capture_rate / 1000)
+        held: list[np.ndarray] = []
+        held_samples = 0
         discarded = 0
         while True:
             try:
-                discarded += len(self._q.get_nowait())
+                block = self._q.get_nowait()
             except queue.Empty:
                 break
+            discarded += len(block)
+            if keep_samples:
+                # Newest-first, so the tail is what survives.
+                held.append(block)
+                held_samples += len(block)
+                while held and held_samples - len(held[0]) >= keep_samples:
+                    held_samples -= len(held.pop(0))
+        kept = 0
+        for block in held:
+            try:
+                self._q.put_nowait(block)
+            except queue.Full:  # a full queue means live audio won the race
+                break
+            discarded -= len(block)
+            kept += len(block)
         # The counter only ever climbs, and readers keep their own baseline.
         # Zeroing it from here was a read-modify-write racing the audio thread's
         # `+=`, which is not atomic — the occasional increment simply vanished.
@@ -791,6 +824,12 @@ class Microphone:
         dropped = self._dropped_samples - self._drain_baseline
         self._drain_baseline = self._dropped_samples
         if discarded or dropped:
-            log.debug("drained %.0f ms of buffered audio, %.0f ms dropped while busy",
-                      discarded * 1000 / self.cfg.capture_rate,
-                      dropped * 1000 / self.cfg.capture_rate)
+            # INFO once it is enough audio to hold a syllable — that is the
+            # point at which this stops being bookkeeping and starts being a
+            # candidate explanation for a command that went missing.
+            ms = discarded * 1000 / self.cfg.capture_rate
+            say = log.info if ms >= 200 else log.debug
+            say("drained %.0f ms of buffered audio (kept %.0f ms), "
+                "%.0f ms dropped while busy", ms,
+                kept * 1000 / self.cfg.capture_rate,
+                dropped * 1000 / self.cfg.capture_rate)

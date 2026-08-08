@@ -15,11 +15,14 @@ module skips rather than fails, and the suite still runs anywhere:
 
 from __future__ import annotations
 
+import queue
+import types
 import unittest
 
 try:
     import numpy as np
 
+    from aia.audio.capture import Microphone
     from aia.audio.vad import Endpointer
     from aia.core.config import CONFIG
 
@@ -190,6 +193,61 @@ class RejectedAudioIsKept(unittest.TestCase):
         ep._is_speech = lambda frame: next(it, False)
         self.assertIsNotNone(ep.collect(self._frames(len(pattern) + 2000)))
         self.assertIsNone(ep.rejected)
+
+
+@unittest.skipUnless(DEPS, "needs numpy and webrtcvad; run this one on the Pi")
+class BoundedDrain(unittest.TestCase):
+    """`Microphone.drain(keep_ms=...)` — what survives the wake word.
+
+    Driven against a stub rather than a real `Microphone`, because
+    constructing one opens the capture device and the assistant is normally
+    holding it. Only `_q` and `cfg` are touched.
+    """
+
+    def _stub(self, n_blocks: int):
+        s = types.SimpleNamespace()
+        s.cfg = CONFIG.audio
+        s._q = queue.Queue(maxsize=1000)
+        s._dropped_samples = 0
+        s._drain_baseline = 0
+        for i in range(n_blocks):
+            s._q.put_nowait(np.full(self.block, i, dtype=np.int16))
+        return s
+
+    @property
+    def block(self) -> int:
+        return CONFIG.audio.capture_rate // 100  # 10 ms
+
+    def _remaining(self, s):
+        out = []
+        while not s._q.empty():
+            out.append(s._q.get_nowait())
+        return out
+
+    def test_keeps_the_newest_audio_in_order(self):
+        """The tail is the user's opening syllable; the head is the music."""
+        s = self._stub(100)  # 1000 ms buffered
+        Microphone.drain(s, keep_ms=700)
+
+        left = self._remaining(s)
+        kept_ms = sum(len(b) for b in left) * 1000 / CONFIG.audio.capture_rate
+        ids = [int(b[0]) for b in left]
+        self.assertGreaterEqual(kept_ms, 700)
+        self.assertLess(kept_ms, 700 + self.block * 1000 / CONFIG.audio.capture_rate + 1)
+        self.assertEqual(ids[-1], 99, "the newest block must survive")
+        self.assertEqual(ids, sorted(ids), "spliced audio would corrupt timing")
+
+    def test_default_still_takes_everything(self):
+        """After speaking, all of it is the assistant's own voice."""
+        s = self._stub(100)
+        Microphone.drain(s)
+        self.assertTrue(s._q.empty())
+
+    def test_a_buffer_shorter_than_keep_ms_is_left_alone(self):
+        """The steady-state case: the queue is near-empty and nothing is lost."""
+        s = self._stub(3)  # 30 ms buffered
+        Microphone.drain(s, keep_ms=700)
+        self.assertEqual(s._q.qsize(), 3)
 
 
 if __name__ == "__main__":
