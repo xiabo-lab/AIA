@@ -48,6 +48,44 @@ class Endpointer:
         self.rejected: np.ndarray | None = None
         self.reject_reason: str | None = None
 
+    @property
+    def _run_bar_ms(self) -> int:
+        """`min_run_ms`, lowered to something a run can actually reach.
+
+        Runs are counted a frame at a time, so their length is always a
+        multiple of `frame_ms` — at 30 ms frames a run is 360, 390 or 420 ms
+        and never 400. Comparing against a bar of 400 therefore demands 420,
+        and 390 is the closest a capture can come without passing.
+
+        That is not a rounding curiosity. Three separate failures on
+        2026-08-07 reported *exactly* 390 ms unbroken, which is the value the
+        grid produces when speech ran right up to the intended bar:
+
+          19:35:34  discarding utterance ... (390 ms unbroken)
+          21:16:54  discarding utterance ... (390 ms unbroken)
+          23:54:14  utterance stalled ...    (390 ms unbroken)
+
+        So the bar is floored onto the grid rather than the config number being
+        edited: 400 keeps meaning "about four hundred", and the frame size —
+        which is an audio-format constraint, not a tuning knob — stops silently
+        adding 5% to every threshold expressed in milliseconds.
+        """
+        return self.cfg.min_run_ms - (self.cfg.min_run_ms % self._frame_ms)
+
+    def _is_utterance(self, speech_ms: int, longest_run_ms: int) -> bool:
+        """Does this look like something a person said on purpose?
+
+        Two ways to qualify. Enough voiced audio *and* enough of it unbroken is
+        the ordinary one. The second exists because the unbroken bar was
+        calibrated against captures holding a few hundred milliseconds of
+        speech and is simply not evidence about a capture holding seconds of
+        it — see `VadConfig.ample_speech_ms`.
+        """
+        if speech_ms < self.cfg.min_speech_ms:
+            return False
+        return (longest_run_ms >= self._run_bar_ms
+                or speech_ms >= self.cfg.ample_speech_ms)
+
     def _fresh_vad(self) -> None:
         """Start each utterance from the same state as every other one.
 
@@ -142,6 +180,12 @@ class Endpointer:
         command; one missed recording held 330 ms of speech whose longest
         continuous stretch was 150 ms. Real phrases here run 1260 ms unbroken.
 
+        It is also not evidence about a capture holding *seconds* of speech,
+        which is why `ample_speech_ms` waives it — see `_is_utterance`. And the
+        bar itself is frame-aligned before use, because a threshold in
+        milliseconds that the frame grid cannot land on is 5% higher than it
+        reads; see `_run_bar_ms`.
+
         Falling short of either bar does not end the turn — the loop keeps
         listening, up to `max_wait_ms` of silence. That is the whole point: the
         failure being fixed was a breath ending the capture a second before the
@@ -228,8 +272,7 @@ class Endpointer:
             # gives the real command, arriving a second after somebody cleared
             # their throat, somewhere to land.
             if (silence_ms >= self.cfg.silence_ms
-                    and speech_ms >= self.cfg.min_speech_ms
-                    and longest_run_ms >= self.cfg.min_run_ms):
+                    and self._is_utterance(speech_ms, longest_run_ms)):
                 break
             if len(collected) * self._frame_ms >= self.cfg.max_utterance_ms:
                 log.warning("utterance hit the %d ms cap", self.cfg.max_utterance_ms)
@@ -244,10 +287,10 @@ class Endpointer:
                 reject("stalled")
                 return None
 
-        if (not collected or speech_ms < self.cfg.min_speech_ms
-                or longest_run_ms < self.cfg.min_run_ms):
-            log.info("discarding utterance with %d ms of speech (%d ms unbroken)",
-                     speech_ms, longest_run_ms)
+        if not collected or not self._is_utterance(speech_ms, longest_run_ms):
+            log.info("discarding utterance with %d ms of speech (%d ms unbroken, "
+                     "bar %d/%d ms)", speech_ms, longest_run_ms,
+                     self.cfg.min_speech_ms, self._run_bar_ms)
             reject("discarded")
             return None
         audio = np.concatenate(collected)

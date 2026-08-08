@@ -29,6 +29,104 @@ except ImportError:  # no numpy/webrtcvad — the development machine
 
 
 @unittest.skipUnless(DEPS, "needs numpy and webrtcvad; run this one on the Pi")
+class EndpointerDecision(unittest.TestCase):
+    """What counts as something a person said on purpose.
+
+    The point is not that the bars now admit more — it is that they admit the
+    four captures below, which were real commands, and still reject the two
+    after them, which were noise.
+    """
+
+    # 390 ms is the longest run the 30 ms frame grid can produce below a
+    # 400 ms bar, and it is the number all three failures reported.
+    NEAR_MISS_RUN_MS = 390
+
+    @property
+    def frame_ms(self) -> int:
+        return CONFIG.audio.frame_ms
+
+    def _frames(self, n: int):
+        return (np.zeros(CONFIG.audio.frame_samples, dtype=np.int16)
+                for _ in range(n))
+
+    def _run(self, pattern):
+        """Returns (audio, reason). Trailing silence lets every path exit."""
+        ep = Endpointer(CONFIG.audio, CONFIG.vad)
+        it = iter(pattern)
+        ep._is_speech = lambda frame: next(it, False)
+        audio = ep.collect(self._frames(len(pattern) + 2000))
+        return audio, ep.reject_reason
+
+    def _speech(self, ms: int):
+        return [True] * (ms // self.frame_ms)
+
+    def _silence(self, ms: int):
+        return [False] * (ms // self.frame_ms)
+
+    def _fragmented(self, total_ms: int, run_ms: int):
+        """Speech totalling `total_ms`, never unbroken for longer than `run_ms`.
+
+        This is what a command spoken over ducked music looks like to
+        webrtcvad: plenty of voiced audio, chopped up by the song behind it.
+        """
+        pattern: list[bool] = []
+        remaining = total_ms
+        while remaining > 0:
+            chunk = min(run_ms, remaining)
+            if pattern:
+                pattern += self._silence(self.frame_ms)
+            pattern += self._speech(chunk)
+            remaining -= chunk
+        return pattern
+
+    def test_run_bar_is_reachable_on_the_frame_grid(self):
+        """A bar of 400 ms demanded 420 — runs only come in frame steps."""
+        ep = Endpointer(CONFIG.audio, CONFIG.vad)
+        self.assertEqual(ep._run_bar_ms % self.frame_ms, 0)
+        self.assertLessEqual(ep._run_bar_ms, CONFIG.vad.min_run_ms)
+        self.assertGreaterEqual(self.NEAR_MISS_RUN_MS, ep._run_bar_ms)
+
+    def test_long_fragmented_capture_is_kept(self):
+        """19:35:34 and 21:16:54 — seconds of speech, thrown away."""
+        for total_ms in (3780, 3240):
+            with self.subTest(total_ms=total_ms):
+                audio, reason = self._run(
+                    self._fragmented(total_ms, self.NEAR_MISS_RUN_MS)
+                    + self._silence(600))
+                self.assertIsNotNone(
+                    audio, f"{total_ms} ms of speech was discarded ({reason})")
+
+    def test_short_command_at_the_grid_boundary_is_kept(self):
+        """23:54:14 — 720 ms of speech, 390 ms unbroken, stalled and lost."""
+        audio, reason = self._run(
+            self._fragmented(720, self.NEAR_MISS_RUN_MS) + self._silence(600))
+        self.assertIsNotNone(audio, f"a 720 ms command was rejected ({reason})")
+
+    def test_capture_holding_almost_nothing_is_still_rejected(self):
+        """23:53:19 — 210 ms of speech. This one really was nothing."""
+        audio, reason = self._run(self._speech(210) + self._silence(5000))
+        self.assertIsNone(audio)
+        self.assertEqual(reason, "stalled")
+
+    def test_a_cough_is_still_rejected(self):
+        """What `min_run_ms` is for: a scatter of noise, not a command.
+
+        330 ms total with a 150 ms longest run is the recording that motivated
+        the unbroken-run bar. Waiving that bar for long captures must not
+        waive it for this one.
+        """
+        audio, _ = self._run(self._fragmented(330, 150) + self._silence(5000))
+        self.assertIsNone(audio)
+
+    def test_an_ordinary_command_still_needs_an_unbroken_run(self):
+        """The waiver is for long captures only — see ample_speech_ms."""
+        self.assertGreater(CONFIG.vad.ample_speech_ms, CONFIG.vad.min_speech_ms)
+        # 600 ms total, longest run 150 ms: above min_speech, below ample.
+        audio, _ = self._run(self._fragmented(600, 150) + self._silence(5000))
+        self.assertIsNone(audio)
+
+
+@unittest.skipUnless(DEPS, "needs numpy and webrtcvad; run this one on the Pi")
 class RejectedAudioIsKept(unittest.TestCase):
     """A failed turn must stop destroying its own evidence.
 

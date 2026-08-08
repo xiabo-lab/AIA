@@ -246,6 +246,27 @@ class VadConfig:
     # unbroken run was 150 ms. Real phrases in these recordings run 1260 ms
     # unbroken.
     min_run_ms: int = 400
+    # ...unless the capture holds this much voiced audio in total, in which case
+    # the unbroken-run bar is waived.
+    #
+    # `min_run_ms` was measured against the population it was built to reject:
+    # captures holding 300-660 ms of voiced audio whose longest run was 150 ms.
+    # It was never meant to judge a capture holding *seconds* of speech, and on
+    # 2026-08-07 it threw two of those away — 3780 ms and 3240 ms of voiced
+    # audio, discarded whole because no single run reached the bar:
+    #
+    #   19:35:34  discarding utterance with 3780 ms of speech (390 ms unbroken)
+    #   21:16:54  discarding utterance with 3240 ms of speech (390 ms unbroken)
+    #
+    # A cough is not four seconds long. Both were captures made over ducked
+    # music, where the VAD toggles on the song and no run survives — but the
+    # user's command is in there, and rejecting it outright guarantees the turn
+    # is lost, where transcribing it at least gives the router something.
+    #
+    # 1500 ms sits above the top of the real-phrase range these recordings show
+    # (1140-1290 ms voiced), so an ordinary command still has to clear the run
+    # bar and only the long, fragmented captures are let through on total alone.
+    ample_speech_ms: int = 1500
     # Audio kept from just before speech onset, so the first phoneme survives.
     #
     # 300 ms was less than the phrase it most needed to protect. At ~320 ms per
@@ -590,6 +611,19 @@ class Config:
             raise ValueError(
                 f"audio.target_rate={self.audio.target_rate} but the STT and wake "
                 f"models are all 16 kHz. Decimate to 16000 in capture instead."
+            )
+
+        # `ample_speech_ms` waives the unbroken-run bar, and it can only mean
+        # something if it is *above* the bar for admitting a capture at all.
+        # At or below `min_speech_ms` every capture that qualifies also waives,
+        # which silently deletes `min_run_ms` instead of relaxing it — the
+        # cough guard would be gone and nothing would say so.
+        if self.vad.ample_speech_ms <= self.vad.min_speech_ms:
+            raise ValueError(
+                f"vad.ample_speech_ms={self.vad.ample_speech_ms} is at or below "
+                f"vad.min_speech_ms={self.vad.min_speech_ms}, which waives "
+                f"min_run_ms for every capture rather than for long ones. "
+                f"Raise ample_speech_ms."
             )
 
         # Two rules delete recordings and they must not contradict each other.
