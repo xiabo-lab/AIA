@@ -42,6 +42,11 @@ class Endpointer:
         self.cfg = cfg
         self.vad = webrtcvad.Vad(cfg.aggressiveness)
         self._frame_ms = audio.frame_ms
+        # Everything heard during a capture that was then rejected, and why.
+        # See `collect` — the caller saves these so a failure can be listened
+        # to instead of guessed at.
+        self.rejected: np.ndarray | None = None
+        self.reject_reason: str | None = None
 
     def _fresh_vad(self) -> None:
         """Start each utterance from the same state as every other one.
@@ -141,9 +146,23 @@ class Endpointer:
         listening, up to `max_wait_ms` of silence. That is the whole point: the
         failure being fixed was a breath ending the capture a second before the
         command was spoken, and the cure is to still be listening when it is.
+
+        **A rejection keeps its audio.** Every path that returns None leaves
+        what it heard on `self.rejected`, with `self.reject_reason` naming the
+        path. Until this existed a failed turn destroyed its own evidence: the
+        journal said "390 ms unbroken" and there was no way to find out whether
+        that was the user's voice being chopped up or the room's music being
+        counted, because the only recordings kept were the ones that worked.
         """
         collected: list[np.ndarray] = []
         preroll: list[np.ndarray] = []
+        # Every frame this call consumed, kept only so a rejection can be
+        # saved and listened to. `collected` starts at speech onset and so is
+        # empty on the one failure that matters most — the capture that never
+        # started — which is exactly the audio needed to tell "the user said
+        # nothing" from "the user spoke and we did not hear it". Bounded by the
+        # loop's own exits: max_wait_ms then max_utterance_ms, ~14 s worst case.
+        heard: list[np.ndarray] = []
         silence_ms = 0
         waited_ms = 0
         onset_ms = 0
@@ -154,10 +173,18 @@ class Endpointer:
         peak_sample = 0
 
         self._fresh_vad()
+        self.rejected = None
+        self.reject_reason = None
         preroll_frames = max(1, self.cfg.preroll_ms // self._frame_ms)
+
+        def reject(reason: str) -> None:
+            """Hand the caller the audio behind a rejection, then drop it."""
+            self.reject_reason = reason
+            self.rejected = np.concatenate(heard) if heard else None
 
         for frame in frames:
             speech = self._is_speech(frame)
+            heard.append(frame)
             if on_frame is not None:
                 on_frame(frame, speech, started)
 
@@ -181,6 +208,7 @@ class Endpointer:
                     speech_ms = run_ms = longest_run_ms = onset_ms
                 elif waited_ms >= self.cfg.max_wait_ms:
                     log.info("no speech after wake word (%d ms)", waited_ms)
+                    reject("nospeech")
                     return None
                 continue
 
@@ -213,12 +241,14 @@ class Endpointer:
             if silence_ms >= self.cfg.max_wait_ms:
                 log.info("utterance stalled with only %d ms of speech (%d ms unbroken)",
                          speech_ms, longest_run_ms)
+                reject("stalled")
                 return None
 
         if (not collected or speech_ms < self.cfg.min_speech_ms
                 or longest_run_ms < self.cfg.min_run_ms):
             log.info("discarding utterance with %d ms of speech (%d ms unbroken)",
                      speech_ms, longest_run_ms)
+            reject("discarded")
             return None
         audio = np.concatenate(collected)
         log.info("utterance: %.2f s (%d ms voiced, %d ms unbroken)",

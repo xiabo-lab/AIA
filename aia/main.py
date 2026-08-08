@@ -151,7 +151,8 @@ def is_affirmative(text: str) -> bool | None:
     return None
 
 
-def save_utterance(audio, rate: int, keep: int, retention: RetentionConfig) -> None:
+def save_utterance(audio, rate: int, keep: int, retention: RetentionConfig,
+                   suffix: str = "") -> None:
     """Write the captured utterance to .bench/utterances for offline replay.
 
     Every accuracy number so far came from synthesised speech, which is clean,
@@ -174,10 +175,19 @@ def save_utterance(audio, rate: int, keep: int, retention: RetentionConfig) -> N
     the rule that actually bounds how long anything said in this room is kept —
     see `aia/ui/retention.py`. The two agree on a directory because both read
     it from `RetentionConfig` rather than each working one out.
+
+    `suffix` marks a capture the endpointer *rejected*, which is saved here and
+    not somewhere separate on purpose. Both prunes glob `*.wav` in this one
+    directory, so a reject inherits the 24-hour expiry and the count cap
+    without a second set of rules — a failed turn is still someone's voice in
+    their kitchen, and it must not outlive the ones that worked. The timestamp
+    stays at the front of the name because both prunes sort by name and mean
+    age when they do.
     """
     directory = retention.recordings
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}.wav"
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    path = directory / f"{stamp}{'-' + suffix if suffix else ''}.wav"
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -338,6 +348,13 @@ def main() -> int:
                 if audio is not None and save_audio:
                     save_utterance(audio, cfg.audio.target_rate,
                                    cfg.audio.keep_utterances, cfg.retention)
+                elif audio is None and save_audio and endpointer.rejected is not None:
+                    # The turn the user is complaining about. Saved under the
+                    # reason it failed, so "it did not hear me" can be answered
+                    # by listening to what it did hear.
+                    save_utterance(endpointer.rejected, cfg.audio.target_rate,
+                                   cfg.audio.keep_utterances, cfg.retention,
+                                   suffix=endpointer.reject_reason or "rejected")
                 if audio is None:
                     # Nothing was said — a false wake, or the user changed their
                     # mind. Put the music straight back and take the "Listening…"
