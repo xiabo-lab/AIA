@@ -72,6 +72,17 @@ class Endpointer:
         """
         return self.cfg.min_run_ms - (self.cfg.min_run_ms % self._frame_ms)
 
+    @property
+    def _speech_bar_ms(self) -> int:
+        """`min_speech_ms`, on the frame grid, for the same reason as above.
+
+        Voiced time is accumulated a frame at a time exactly as runs are, so a
+        bar of 500 ms is really 510 — it can only be met at 480 or 510. That
+        cost a real 关机 the turn it was said in. Aligned here rather than left
+        to whoever next edits the number.
+        """
+        return self.cfg.min_speech_ms - (self.cfg.min_speech_ms % self._frame_ms)
+
     def _is_utterance(self, speech_ms: int, longest_run_ms: int) -> bool:
         """Does this look like something a person said on purpose?
 
@@ -81,7 +92,7 @@ class Endpointer:
         speech and is simply not evidence about a capture holding seconds of
         it — see `VadConfig.ample_speech_ms`.
         """
-        if speech_ms < self.cfg.min_speech_ms:
+        if speech_ms < self._speech_bar_ms:
             return False
         return (longest_run_ms >= self._run_bar_ms
                 or speech_ms >= self.cfg.ample_speech_ms)
@@ -290,7 +301,7 @@ class Endpointer:
         if not collected or not self._is_utterance(speech_ms, longest_run_ms):
             log.info("discarding utterance with %d ms of speech (%d ms unbroken, "
                      "bar %d/%d ms)", speech_ms, longest_run_ms,
-                     self.cfg.min_speech_ms, self._run_bar_ms)
+                     self._speech_bar_ms, self._run_bar_ms)
             reject("discarded")
             return None
         audio = np.concatenate(collected)

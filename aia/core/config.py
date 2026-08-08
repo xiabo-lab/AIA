@@ -104,10 +104,30 @@ class AudioConfig:
         # costs a whole turn while a quiet capture costs nothing measurable —
         # the speech-band SNR here is 45 dB and SenseVoice normalises.
         #
-        # The thing to watch is the other end: the p10 peak was −19.4 dBFS and
-        # is now around −31, and no distance test has ever been run on this
-        # capsule. If wake detection falls off across the room, that is where
-        # it will show, and step 12 (6.00 dB) is the halfway house.
+        # The thing to watch was the other end: the p10 peak was −19.4 dBFS and
+        # would now sit around −31, and no distance test had ever been run on
+        # this capsule. **That is exactly what went wrong, and step 12 is the
+        # halfway house this comment predicted.**
+        #
+        # On 2026-08-08, 3 of 7 turns were lost at 0.00 dB. All three rejected
+        # captures were saved (see `Endpointer.rejected`) and all three held a
+        # real command — 关机, 搜索歌词, 搜索歌词 — which SenseVoice transcribed
+        # correctly straight off the disk. The recogniser could hear them; only
+        # webrtcvad could not follow them, because all three peaked in a tight
+        # cluster at −31.6 to −32.4 dBFS against a −20.4 dBFS corpus median.
+        # Amplified 6 dB offline, two of the three pass the endpointer; at
+        # 12 dB all three do. The bars were not the disease, the level was.
+        #
+        # Step 12 is 6.00 dB, and it does not reopen the saturation it was
+        # lowered to escape. That failure was driven by a p90 peak of −0.0 dBFS
+        # at 12.00 dB; the loudest capture ever measured at step 8 was
+        # −15.0 dBFS, which at step 12 becomes −9.0 — still below the −6 dBFS
+        # `_HOT_PEAK` line in audio/vad.py where captures stop being
+        # endpointable, and 9 dB clear of the rail.
+        #
+        # So this is deliberately half of what was removed. If the loud tail
+        # comes back — watch for `capture ran to the cap` and the clipping
+        # warning — step 10 (3.00 dB) is the next stop down, not a return to 16.
         MicProfile(match="USB Microphone", gain=8, agc=False,
                    note="Generalplus, omnidirectional (8/30 = 0.00 dB)"),
         # TI PCM2902. Every recognition threshold in this project was tuned
@@ -235,11 +255,21 @@ class VadConfig:
     # or a hesitation cleared it, the capture closed, and the command that
     # followed was never heard.
     #
-    # 500 ms still admits the shortest real command: at the ~320 ms per
-    # syllable these recordings show, 暂停 is around 640 ms. Raising it further
-    # would start cutting off genuine two-syllable commands, so this is a floor
-    # set by what people say, not by what noise happens to measure.
-    min_speech_ms: int = 500
+    # 500 ms was set on the estimate that at ~320 ms per syllable the shortest
+    # real command, 暂停, runs about 640 ms. **Measurement disagreed.** On
+    # 2026-08-08 a capture rejected here held 关机 — the exact command being
+    # reported as broken — with 450 ms of voiced audio, and SenseVoice read it
+    # off the disk correctly. At a healthy level the same clip only reaches
+    # 570 ms. A two-syllable command has almost no margin against 500, and the
+    # frame grid removed what little it had: voiced time is counted 30 ms at a
+    # time, so it lands on 480 or 510 and never 500, making the real bar 510.
+    #
+    # 420 restores the margin — 14 frames exactly, so the grid costs nothing —
+    # while staying above the noise this guard was built for: the coughs and
+    # doors that motivated it held 300-330 ms. It is also still backed by
+    # `min_run_ms`, which is the bar that actually separates a command from a
+    # scatter of unrelated thumps.
+    min_speech_ms: int = 420
     # ...of which this much has to be *contiguous*. Total voiced time alone
     # cannot tell a command from a scatter of unrelated noises across a few
     # seconds, and one missed capture held 330 ms of speech whose longest

@@ -105,6 +105,21 @@ class EndpointerDecision(unittest.TestCase):
             self._fragmented(720, self.NEAR_MISS_RUN_MS) + self._silence(600))
         self.assertIsNotNone(audio, f"a 720 ms command was rejected ({reason})")
 
+    def test_speech_bar_is_reachable_on_the_frame_grid(self):
+        """500 ms demanded 510, for the same reason 400 demanded 420."""
+        ep = Endpointer(CONFIG.audio, CONFIG.vad)
+        self.assertEqual(ep._speech_bar_ms % self.frame_ms, 0)
+        self.assertLessEqual(ep._speech_bar_ms, CONFIG.vad.min_speech_ms)
+
+    def test_a_short_two_syllable_command_is_kept(self):
+        """10:49:15 — 450 ms of voiced audio that transcribed to 关机.
+
+        The command being reported as broken, thrown away by the bar meant to
+        reject coughs. It is one unbroken run, which is what tells it from one.
+        """
+        audio, reason = self._run(self._speech(450) + self._silence(600))
+        self.assertIsNotNone(audio, f"'关机' was rejected ({reason})")
+
     def test_capture_holding_almost_nothing_is_still_rejected(self):
         """23:53:19 — 210 ms of speech. This one really was nothing."""
         audio, reason = self._run(self._speech(210) + self._silence(5000))
