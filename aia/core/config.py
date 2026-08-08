@@ -128,8 +128,8 @@ class AudioConfig:
         # So this is deliberately half of what was removed. If the loud tail
         # comes back — watch for `capture ran to the cap` and the clipping
         # warning — step 10 (3.00 dB) is the next stop down, not a return to 16.
-        MicProfile(match="USB Microphone", gain=8, agc=False,
-                   note="Generalplus, omnidirectional (8/30 = 0.00 dB)"),
+        MicProfile(match="USB Microphone", gain=12, agc=False,
+                   note="Generalplus, omnidirectional (12/30 = 6.00 dB)"),
         # TI PCM2902. Every recognition threshold in this project was tuned
         # against this capsule, so it stays as the fallback. 8/16 is the value
         # the audio review settled on; 16/16 is what caused the clipping.
